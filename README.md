@@ -101,7 +101,7 @@ Under emulators the AI panel uses a clearly labelled fake model so the review fl
 
 ### Production setup (project owner, one time)
 1. Firebase console, Authentication: enable **Email/Password**, **Anonymous** and **Google**.
-2. Firebase console, **AI Logic, Get started, Gemini Developer API** (the no-cost provider; not the Vertex/Agent Platform option, which needs billing).
+2. **AI Logic**: Firebase console, *AI Logic, Get started, Gemini Developer API* (the no-cost provider; not Vertex, which needs billing). The Gemini API key lives in the project's AI Logic config, never in the app or the repo. Verify with `npm run verify:ai`.
 3. `node web/scripts/provision.mjs --prod` creates accounts (random passwords go to the git-ignored `.secrets/accounts.json`); add `--easy` for one short temporary demo password. Then `node web/scripts/demo-logins.mjs --open`, and `node web/scripts/verify-accounts.mjs` to confirm every role. Rotate afterwards with `--reset-passwords`.
    Check Gemini with `npm run verify:ai` (one labelled synthetic case, real model call, case cancelled afterwards).
 4. `firebase deploy --only firestore:rules,hosting`.

@@ -8,6 +8,8 @@ import { saveAiDraft } from './workflow'
 // the deterministic engine and with people. All output is labelled as AI-generated, and the original report is untouched.
 
 export const AI_MODEL = 'gemini-3.5-flash'
+/** Tried in order. The no-cost tier limits each model separately, so when one is out of quota the next one still answers. The briefing records the model that actually wrote it. */
+export const AI_MODELS = [AI_MODEL, 'gemini-flash-latest', 'gemini-flash-lite-latest'] as const
 /** Gemini Developer API accepts at most 20 MB of inline data per request, base64 included. */
 export const MAX_AI_INLINE_BYTES = 14 * 1024 * 1024
 export const AI_TIMEOUT_MS = 90_000
@@ -206,23 +208,35 @@ export async function createFirebaseAiClient(app: import('firebase/app').Firebas
       handoff: S.string(),
     },
   })
+  let used: string = AI_MODEL
   return {
-    model: AI_MODEL,
+    get model() { return used },
     async generate(system, prompt, files) {
-      const model = getGenerativeModel(ai, { model: AI_MODEL, systemInstruction: system, generationConfig: { responseMimeType: 'application/json', responseSchema: schema, temperature: 0.1 } })
       const parts = files.map((f) => ({ inlineData: { mimeType: f.mime, data: toBase64(f.data) } }))
-      // The no-cost tier sometimes answers 429 (rate limit) or 503 (overloaded) for a moment: retry twice, with a short pause, before giving up.
-      for (let attempt = 0; ; attempt++) {
-        try {
-          const res = await model.generateContent([...parts, { text: prompt }] as unknown as Parameters<typeof model.generateContent>[0])
-          return res.response.text()
-        } catch (e) {
-          if (attempt >= 2 || !isTransientAiError(e)) throw e
-          await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)))
+      let last: unknown
+      for (const name of AI_MODELS) {
+        const model = getGenerativeModel(ai, { model: name, systemInstruction: system, generationConfig: { responseMimeType: 'application/json', responseSchema: schema, temperature: 0.1 } })
+        for (let attempt = 0; attempt < 2; attempt++) {
+          try {
+            const res = await model.generateContent([...parts, { text: prompt }] as unknown as Parameters<typeof model.generateContent>[0])
+            used = name
+            return res.response.text()
+          } catch (e) {
+            last = e
+            if (!isTransientAiError(e)) throw e // a refusal, bad request or permission problem will not improve on another model
+            if (isQuotaError(e)) break // this model is out of quota: go straight to the next one
+            await new Promise((r) => setTimeout(r, 1500)) // brief overload: one more try on the same model
+          }
         }
       }
+      throw last
     },
   }
+}
+
+/** Out of quota on this model (not a brief hiccup): switch models instead of waiting. */
+export function isQuotaError(e: unknown): boolean {
+  return /429|quota|rate.?limit|too many requests|resource.?exhausted/i.test(String((e as { message?: string } | null)?.message ?? e ?? ''))
 }
 
 /** Worth retrying: rate limits, overload and brief outages. A refusal, a bad request or a permission problem is not. */

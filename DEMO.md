@@ -57,7 +57,6 @@ is only on the phone. Copy the receipt code (or use *Share*) for step 10.
 2. See the private phone number and the files. Press **Load** on the audio, video and document: each shows *Checksum verified*.
 3. **AI-assisted briefing:** press **Analyse report**. A draft labelled **AI-generated** appears (transcript, facts, missing information,
    uncertainties). Edit the handoff text, then **Review done: share with crew and hospitals**.
-   *(Requires the one-time AI setup, see "Gemini" below. The rest of the demo works without it.)*
 
 **Expect:** the crew and hospitals only ever see the reviewed briefing, never the draft.
 
@@ -124,10 +123,13 @@ closed (*completed*).
 - **Dark mode.** The sun/moon button. Dark is true black; the logo reverses (white paper, black watch).
 
 ## Gemini (real AI)
-The code calls `gemini-3.5-flash` through Firebase AI Logic. It works only after the one-time console step: open the Firebase console for
-`goldenhour-46131`, **AI Logic, Get started, Gemini Developer API**. Verify with `cd web && npm run verify:ai`, which sends one labelled
-synthetic case with a real image through the app's own code path and prints the briefing. Until that passes, say plainly that the AI step
-was not shown live.
+The briefing is written by `gemini-3.5-flash` through Firebase AI Logic. The Gemini key is stored inside the Firebase project (server-side
+config), never in the app or the repository. It is verified end to end: `cd web && npm run verify:ai` runs ordinary, gibberish,
+prompt-injection, very long, Kannada, PDF, audio and unsupported-file cases against the live project, and the browser suite
+(`npm run test:e2e`) runs one real briefing from a real Chrome. It reads the photo too (it described a clock icon as "a clock icon rather
+than a scene photograph"). It never diagnoses, prescribes or picks a hospital: those sentences are stripped and flagged, and a human must
+press **Review done** before anyone else sees it. Free-tier limits apply: if Google answers *busy* the app retries twice, then says the AI is
+unavailable and the dispatcher reads the original report. Use synthetic data only.
 
 ## If something looks wrong
 | Symptom | Fix |
@@ -137,6 +139,6 @@ was not shown live.
 | Camera does not open on the phone | Allow the camera for the site (lock icon in the address bar). The camera screen offers *Use my phone's camera app* as a fallback. |
 | No sound | Browsers allow sound only after the page was clicked once; turn it on in *Account and settings*. |
 | GPS does nothing | Allow location. Desktop GPS can be inaccurate: use the simulated drive. |
-| "The AI is not available" | The Firebase AI Logic console step has not been done (see above). Everything else works without it. |
+| "The AI is not available" | Google's free tier was busy or rate-limited (it retried twice). Press **Run the AI again** after a few seconds, or carry on from the original report; everything else works without it. |
 
 Demo cases stay on record (closed) in History. Use clearly fake details so they are easy to recognise.

@@ -135,3 +135,13 @@ describe('which AI failures are retried', () => {
     expect(isTransientAiError(null)).toBe(false)
   })
 })
+
+describe('quota handling', () => {
+  it('tells an out-of-quota answer (switch model) from a brief hiccup (retry)', async () => {
+    const { isQuotaError } = await import('./ai')
+    expect(isQuotaError(new Error('[429 Too Many Requests] You exceeded your current quota'))).toBe(true)
+    expect(isQuotaError(new Error('RESOURCE_EXHAUSTED'))).toBe(true)
+    expect(isQuotaError(new Error('[503 Service Unavailable] overloaded'))).toBe(false)
+    expect(isQuotaError(null)).toBe(false)
+  })
+})
