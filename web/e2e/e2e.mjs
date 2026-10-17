@@ -42,6 +42,8 @@ for (let i = 0; i < 80; i++) {
   if (i === 79) { console.error(viteLog); killVite(); process.exit(1) }
 }
 
+// A synthetic camera and microphone stand in for real hardware (this is emulation, not a physical phone camera).
+const FAKE_CAMERA = ['--use-fake-device-for-media-stream', '--use-fake-ui-for-media-stream']
 let browser
 const contexts = []
 let failed = false
@@ -55,7 +57,7 @@ async function waitUntil(fn, message, ms = 25000) {
 }
 
 try {
-  browser = await chromium.launch({ channel: 'chrome', headless: true }).catch(() => chromium.launch({ channel: 'msedge', headless: true }))
+  browser = await chromium.launch({ channel: 'chrome', headless: true, args: FAKE_CAMERA }).catch(() => chromium.launch({ channel: 'msedge', headless: true, args: FAKE_CAMERA }))
   const phone = { width: 390, height: 844 }
   const laptop = { width: 1366, height: 860 }
   const T = { timeout: 25000 }
@@ -246,6 +248,7 @@ try {
   const wenlock = await open('laptop3-hospital', laptop)
   const yenepoya = await open('hospital-declines', laptop)
   let receipt = ''
+  let suggested = ''
 
   await step('staff sign in on their own sessions', async () => {
     await login(dispatcher, 'dispatcher1@goldenhour.demo')
@@ -418,12 +421,20 @@ try {
     await strip(yenepoya, 'Snakebite').click()
     await yenepoya.getByRole('list', { name: 'Attached evidence' }).waitFor(T)
     await yenepoya.getByLabel('Reason for declining').selectOption('Required resource out of stock')
+    const sugg = yenepoya.getByLabel(/another hospital you think is better placed/)
+    const names = (await sugg.locator('option').allInnerTexts()).filter((n) => n !== 'No suggestion')
+    assert.ok(names.length > 0, 'an eligible alternative should be offered')
+    assert.ok(!names.some((n) => /Yenepoya/.test(n)), 'a hospital cannot suggest itself')
+    suggested = names[0]
+    await sugg.selectOption({ label: suggested })
     await yenepoya.getByRole('button', { name: 'Decline', exact: true }).click()
     await yenepoya.getByText('Request closed').waitFor(T)
     assert.equal(await yenepoya.getByRole('list', { name: 'Attached evidence' }).count(), 0)
     assert.equal(await yenepoya.getByText('Briefing from dispatch').count(), 0)
     await yenepoya.getByText(/no longer available to you/).first().waitFor(T)
     await dispatcher.getByText('Declined: Required resource out of stock').first().waitFor(T)
+    await dispatcher.getByTestId('suggestion').first().getByText(new RegExp(`suggests ${suggested.replace(/[()]/g, '.')}`)).waitFor(T)
+    await dispatcher.getByTestId('suggestion').first().getByText(/suggestion only/).waitFor(T)
   })
 
   await step('dispatch gets an explained recommendation and approves; the crew must acknowledge the destination', async () => {
@@ -634,6 +645,218 @@ try {
     assert.ok(m.icons.some((i) => i.purpose === 'maskable'))
     for (const i of m.icons) assert.equal((await fetch(BASE + i.src)).status, 200, i.src)
     assert.equal((await fetch(`${BASE}/sw.js`)).status, 200)
+  })
+
+  // ===========================================================================================================
+  section('Camera, accounts, false reports and hospital suggestions')
+  const quickReport = async (page, type, brief) => {
+    await page.goto(BASE)
+    await page.getByRole('button', { name: /Report an emergency/ }).first().click()
+    await page.getByRole('button', { name: type }).click()
+    await page.getByRole('button', { name: 'Next' }).click()
+    await page.getByLabel('Pick a demo place').selectOption({ label: 'Kankanady' })
+    await page.getByRole('button', { name: 'Next' }).click()
+    await page.getByPlaceholder('Adult man, bitten on the leg, conscious').fill(brief)
+  }
+  const sendReport = async (page) => {
+    await page.getByRole('button', { name: 'Next' }).click()
+    await page.getByRole('button', { name: 'Send to dispatch' }).click()
+    await page.getByTestId('receipt-code').waitFor(T)
+  }
+
+  const cam = await open('camera-phone', phone, { hasTouch: true, isMobile: true })
+  // Headless Chrome's built-in fake camera stops working after its first use, so the page gets a synthetic animated camera
+  // (canvas.captureStream) instead. This exercises the real viewfinder, shutter, recorder and upload code, but it is NOT real camera hardware.
+  await cam.addInitScript(() => {
+    navigator.mediaDevices.getUserMedia = async () => {
+      const c = document.createElement('canvas'); c.width = 640; c.height = 480
+      const g = c.getContext('2d'); let n = 0
+      setInterval(() => { g.fillStyle = `hsl(${(n += 7) % 360} 70% 50%)`; g.fillRect(0, 0, 640, 480); g.fillStyle = '#fff'; g.font = '48px sans-serif'; g.fillText(`frame ${n}`, 40, 240) }, 66)
+      return c.captureStream(15)
+    }
+    const real = navigator.mediaDevices.enumerateDevices.bind(navigator.mediaDevices)
+    navigator.mediaDevices.enumerateDevices = async () => [{ kind: 'videoinput', deviceId: 'a', label: 'rear', groupId: 'g' }, { kind: 'videoinput', deviceId: 'b', label: 'front', groupId: 'g' }, ...(await real().catch(() => []))]
+  })
+  await step('CAMERA: Take a photo opens a live viewfinder with shutter, retake and confirm; Record a video works the same way', async () => {
+    await quickReport(cam, 'Trauma', 'CAMERA TEST photo and video')
+    await cam.getByRole('button', { name: 'Take a photo' }).click()
+    await cam.getByRole('dialog', { name: 'Take a photo' }).waitFor(T)
+    await waitUntil(async () => !(await cam.getByRole('button', { name: 'Take the photo' }).isDisabled()), 'the viewfinder should go live')
+    await shot(cam, '22-camera-viewfinder-phone')
+    await cam.getByRole('button', { name: 'Take the photo' }).click()
+    await cam.getByRole('img', { name: 'The photo you just took' }).waitFor(T)
+    await cam.getByRole('button', { name: 'Retake' }).click()
+    await waitUntil(async () => !(await cam.getByRole('button', { name: 'Take the photo' }).isDisabled()), 'the viewfinder should restart after Retake')
+    await cam.getByRole('button', { name: 'Take the photo' }).click()
+    await cam.getByRole('button', { name: 'Use this photo' }).click()
+    await cam.getByRole('dialog').waitFor({ state: 'detached', ...T })
+    await waitUntil(async () => (await cam.locator('.tile').count()) === 1, 'the photo should be attached')
+    assert.match(await cam.locator('.tile-name').first().innerText(), /^photo-.*\.jpg$/)
+
+    await cam.getByRole('button', { name: 'Record a video' }).click()
+    await cam.getByRole('dialog', { name: 'Record a video' }).waitFor(T)
+    await waitUntil(async () => !(await cam.getByRole('button', { name: 'Start recording' }).isDisabled()), 'the video viewfinder should go live')
+    await cam.getByRole('button', { name: 'Start recording' }).click()
+    await cam.getByRole('timer').waitFor(T)
+    await cam.waitForTimeout(1800)
+    await cam.getByRole('button', { name: 'Stop recording' }).click()
+    await cam.getByRole('button', { name: 'Use this video' }).click()
+    await waitUntil(async () => (await cam.locator('.tile').count()) === 2, 'the video should be attached')
+    await noOverflow(cam, 'composer with camera files'); await targets(cam, 'composer with camera files')
+    await shot(cam, '23-camera-attached-phone')
+  })
+
+  await step('CAMERA: cancelling closes the camera and attaches nothing', async () => {
+    await cam.getByRole('button', { name: 'Take a photo' }).click()
+    await cam.getByRole('dialog').waitFor(T)
+    await cam.getByRole('button', { name: 'Close the camera' }).click()
+    await cam.getByRole('dialog').waitFor({ state: 'detached', ...T })
+    assert.equal(await cam.locator('.tile').count(), 2)
+    await cam.getByRole('button', { name: 'Take a photo' }).click()
+    await cam.keyboard.press('Escape')
+    await cam.getByRole('dialog').waitFor({ state: 'detached', ...T })
+  })
+
+  await step('CAMERA: the captured photo and video really upload and show as confirmed', async () => {
+    await sendReport(cam)
+    await cam.getByText('Evidence: 2 of 2 uploaded').waitFor({ timeout: 40000 })
+    assert.equal(await cam.getByText('Uploaded and confirmed by the server').count(), 2)
+  })
+
+  const denied = await open('camera-denied-phone', phone, { hasTouch: true, isMobile: true })
+  await denied.addInitScript(() => {
+    navigator.mediaDevices.getUserMedia = () => Promise.reject(new DOMException('Permission denied', 'NotAllowedError'))
+  })
+  await step('CAMERA: a refused permission explains itself and offers the phone camera app, which still attaches the photo', async () => {
+    await quickReport(denied, 'Trauma', 'CAMERA DENIED TEST')
+    await denied.getByRole('button', { name: 'Take a photo' }).click()
+    await denied.getByText(/Camera permission was refused/).waitFor(T)
+    await denied.getByRole('button', { name: 'Try again' }).waitFor(T)
+    const [chooser] = await Promise.all([denied.waitForEvent('filechooser'), denied.getByRole('button', { name: /Use my phone.s camera app/ }).click()])
+    await chooser.setFiles([{ name: 'from-phone-camera.png', mimeType: 'image/png', buffer: ICON }])
+    await waitUntil(async () => (await denied.locator('.tile').count()) === 1, 'the photo from the phone camera app should attach')
+    await shot(denied, '24-camera-denied-phone')
+  })
+
+  await step('CAMERA: a device with no camera API still works through the phone camera app or a file', async () => {
+    const nocam = await open('no-camera-phone', phone, { hasTouch: true, isMobile: true })
+    await nocam.addInitScript(() => { Object.defineProperty(navigator, 'mediaDevices', { value: undefined, configurable: true }) })
+    await quickReport(nocam, 'Trauma', 'NO CAMERA API TEST')
+    const [chooser] = await Promise.all([nocam.waitForEvent('filechooser'), nocam.getByRole('button', { name: 'Take a photo' }).click()])
+    await chooser.setFiles([{ name: 'fallback.png', mimeType: 'image/png', buffer: ICON }])
+    await waitUntil(async () => (await nocam.locator('.tile').count()) === 1, 'the fallback photo should attach')
+    await nocam.close()
+  })
+
+  const acct = await open('guest-to-account', phone, { hasTouch: true, isMobile: true })
+  let acctReceipt = ''
+  await step('ACCOUNTS: a guest report is kept when the guest creates an account; the account then reopens it after sign-out', async () => {
+    await quickReport(acct, 'Cardiac', 'ACCOUNT UPGRADE TEST chest pain')
+    await sendReport(acct)
+    acctReceipt = (await acct.getByTestId('receipt-code').innerText()).trim()
+    assert.match(acctReceipt, /^[A-Za-z0-9]{20}\.[A-Za-z0-9_-]{32}$/)
+    await acct.goto(`${BASE}/#/account`)
+    await acct.getByRole('heading', { name: 'Create an account' }).waitFor(T)
+    const create = acct.getByRole('button', { name: 'Create account', exact: true })
+    await acct.locator('#signup-email').fill('new.reporter@example.test')
+    await acct.locator('#signup-password').fill('short')
+    assert.ok(await create.isDisabled(), 'a too-short password must not be submittable')
+    await acct.locator('#signup-password').fill('Reporter-pass-1')
+    await create.click()
+    await acct.getByText('Account created. Your reports are now saved to it.').waitFor(T)
+    await acct.getByText('new.reporter@example.test').first().waitFor(T)
+    await acct.getByText('Reporter account').first().waitFor(T)
+    assert.equal(await acct.getByRole('heading', { name: 'Create an account' }).count(), 0, 'the upgrade panel goes away once upgraded')
+    await acct.goto(`${BASE}/#/mine`)
+    await acct.getByText(/Cardiac/).first().waitFor(T)
+    await shot(acct, '25-account-created-phone')
+  })
+
+  await step('ACCOUNTS: sign out, sign in again with the email account, and the same report is there; staff screens stay closed', async () => {
+    await acct.getByRole('button', { name: 'Account menu' }).click()
+    await acct.getByRole('menuitem', { name: /Sign out|Leave and erase/ }).click()
+    await acct.locator('#signin-email').waitFor(T)
+    await acct.locator('#signin-email').fill('new.reporter@example.test')
+    await acct.getByLabel('Password', { exact: true }).fill('Reporter-pass-1')
+    await acct.getByRole('button', { name: 'Sign in', exact: true }).click()
+    await acct.getByText('Signed in as new.reporter@example.test').waitFor(T)
+    await acct.goto(`${BASE}/#/mine`)
+    await acct.getByText(/Cardiac/).first().waitFor(T)
+    assert.equal(await acct.locator('.kpis').count(), 0)
+    await acct.goto(`${BASE}/#/history`)
+    await acct.getByRole('heading', { name: 'Incident history' }).waitFor({ timeout: 2500 }).then(() => assert.fail('a reporter account must not reach staff history'), () => undefined)
+  })
+
+  await step('ACCOUNTS: creating an account with a used email, or signing in with a wrong password, is refused clearly', async () => {
+    const again = await open('duplicate-email', phone, { hasTouch: true, isMobile: true })
+    await again.goto(BASE)
+    await again.getByRole('button', { name: 'Create an account' }).click()
+    await again.locator('#signup-email').fill('new.reporter@example.test')
+    await again.locator('#signup-password').fill('Another-pass-1')
+    await again.getByRole('button', { name: 'Create account', exact: true }).click()
+    await again.getByText(/An account with this email already exists/).waitFor(T)
+    await again.getByRole('button', { name: 'I already have an account' }).click()
+    await again.locator('#signin-email').fill('new.reporter@example.test')
+    await again.getByLabel('Password', { exact: true }).fill('wrong-wrong-1')
+    await again.getByRole('button', { name: 'Sign in', exact: true }).click()
+    await again.getByText('Email or password is incorrect.').waitFor(T)
+    await again.close()
+  })
+
+  await step('ACCOUNTS: the Google button opens the provider window and signs in (emulator provider)', async () => {
+    const g = await open('google', laptop)
+    await g.goto(BASE)
+    const popupP = g.waitForEvent('popup', { timeout: 15000 })
+    await g.getByRole('button', { name: 'Continue with Google' }).click()
+    const pop = await popupP
+    await pop.waitForLoadState('domcontentloaded')
+    await pop.getByText('Add new account', { exact: false }).first().click()
+    await pop.getByRole('button', { name: /Auto-generate user information/i }).click()
+    await pop.getByRole('button', { name: /Sign in with Google/i }).click()
+    await g.getByText(/Signed in as/).waitFor(T)
+    assert.equal(await g.locator('.kpis').count(), 0, 'a Google account is a reporter account, never staff')
+    await g.close()
+  })
+
+  const rep3 = await open('reporter-withdraws', phone, { hasTouch: true, isMobile: true })
+  await step('FALSE REPORTS: a reporter withdraws an untouched report; it stays on record and dispatch can filter for it', async () => {
+    await quickReport(rep3, 'Trauma', 'WITHDRAW TEST sent by mistake')
+    await sendReport(rep3)
+    await mainNav(dispatcher, 'Live').click()
+    await dispatcher.locator('button.strip', { hasText: 'WITHDRAW TEST' }).waitFor({ timeout: 30000 })
+    await rep3.getByRole('button', { name: /Withdraw this report/ }).click()
+    await rep3.getByRole('button', { name: 'Withdraw the report' }).waitFor(T)
+    assert.ok(await rep3.getByRole('button', { name: 'Withdraw the report' }).isDisabled(), 'needs an explicit confirmation')
+    await rep3.getByLabel('Nobody needs an ambulance for this report.').check()
+    await rep3.getByRole('button', { name: 'Withdraw the report' }).click()
+    await rep3.getByText(/This report is closed: withdrawn by reporter/i).waitFor(T)
+    await mainNav(dispatcher, 'History').click()
+    await dispatcher.getByLabel('Status').selectOption('withdrawn')
+    await dispatcher.getByRole('row').filter({ hasText: 'Withdrawn by reporter' }).first().waitFor(T)
+    assert.equal(await dispatcher.locator('button.strip', { hasText: 'WITHDRAW TEST' }).count(), 0, 'a withdrawn report leaves the live board')
+    await dispatcher.getByRole('button', { name: 'Clear filters' }).first().click()
+  })
+
+  await step('FALSE REPORTS: dispatch ends a live case as a false report with a recorded reason, and the ambulance is released', async () => {
+    const r = await open('false-report', phone, { hasTouch: true, isMobile: true })
+    await quickReport(r, 'Burns', 'FALSE REPORT TEST prank call')
+    await sendReport(r)
+    await mainNav(dispatcher, 'Live').click()
+    await dispatcher.locator('button.strip', { hasText: 'FALSE REPORT TEST' }).click()
+    await dispatcher.getByRole('button', { name: 'End this case without a hospital' }).click()
+    const end = dispatcher.getByRole('button', { name: 'End the case' })
+    assert.ok(await end.isDisabled(), 'needs a reason and a confirmation')
+    await dispatcher.getByLabel(/False report/).check()
+    await dispatcher.getByLabel(/Reason \(kept in the audit trail\)/).fill('Caller admitted it was a prank')
+    await dispatcher.getByLabel(/I understand this ends the case/).check()
+    await end.click()
+    await r.getByText(/This report is closed: false report/i).waitFor(T)
+    await mainNav(dispatcher, 'History').click()
+    await dispatcher.getByLabel('Status').selectOption('false')
+    await dispatcher.getByRole('row').filter({ hasText: 'False report' }).first().click()
+    await dispatcher.getByText(/Case ended as false report: Caller admitted it was a prank/).first().waitFor(T)
+    await dispatcher.getByRole('button', { name: 'Clear filters' }).first().click().catch(() => undefined)
+    await r.close()
   })
 
   await step('no unexpected browser errors were logged by any session', async () => {

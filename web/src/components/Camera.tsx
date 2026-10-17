@@ -57,11 +57,19 @@ export function CameraCapture({ mode, onDone, onClose, onFallback }: {
       if (!cameraSupported()) { setProblem({ kind: 'unsupported', text: 'This browser cannot open the camera from a web page.' }); return }
       try {
         const base = { facingMode: { ideal: facing }, width: { ideal: 1920 }, height: { ideal: 1080 } }
+        // A camera that was only just released by the previous screen can briefly report "not found" or "in use": try once more before giving up.
+        const ask = async (c: MediaStreamConstraints): Promise<MediaStream> => {
+          try { return await navigator.mediaDevices.getUserMedia(c) } catch (e) {
+            if (!['NotFoundError', 'NotReadableError', 'AbortError'].includes((e as DOMException).name)) throw e
+            await new Promise((r) => setTimeout(r, 700))
+            return navigator.mediaDevices.getUserMedia(c)
+          }
+        }
         let stream: MediaStream
-        try { stream = await navigator.mediaDevices.getUserMedia({ video: base, audio: mode === 'video' }) }
+        try { stream = await ask({ video: base, audio: mode === 'video' }) }
         catch (e) {
-          // a video note without sound is still useful when only the microphone is refused
-          if (mode === 'video' && (e as DOMException).name === 'NotAllowedError') stream = await navigator.mediaDevices.getUserMedia({ video: base, audio: false })
+          // a video without sound is still useful when the microphone is refused, missing or busy
+          if (mode === 'video' && ['NotAllowedError', 'NotFoundError', 'NotReadableError'].includes((e as DOMException).name)) stream = await ask({ video: base, audio: false })
           else throw e
         }
         if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return }

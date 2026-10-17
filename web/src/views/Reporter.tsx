@@ -170,7 +170,12 @@ export function OpenByReceipt({ code, notify, onClose }: { code: string; notify:
     ;(async () => {
       try {
         const actor = await ensureReporter()
-        await claimCase(db, actor, parsed.caseId, parsed.secret)
+        try { await claimCase(db, actor, parsed.caseId, parsed.secret) } catch (e) {
+          // a session that was created a moment ago can be refused once while its sign-in settles: try again before telling the person the code is wrong
+          if ((e as { code?: string }).code !== 'permission-denied') throw e
+          await new Promise((r) => setTimeout(r, 900))
+          await claimCase(db, actor, parsed.caseId, parsed.secret)
+        }
         saveReceipt({ caseId: parsed.caseId, receipt: `${parsed.caseId}.${parsed.secret}`, createdAtMs: Date.now(), label: 'Reopened report' })
         if (live) setState('ready')
       } catch (e) {
