@@ -1,0 +1,26 @@
+*, *::before, *::after { box-sizing: border-box; }
+html, body, #root { min-height: 100%; }
+body {
+  margin: 0; background: var(--field); color: var(--ink); font-family: var(--font); font-size: 1rem; line-height: 1.5;
+  -webkit-font-smoothing: antialiased; -webkit-tap-highlight-color: transparent; text-rendering: optimizeLegibility;
+}
+h1, h2, h3, h4, p, ul, ol, figure, dl, dd { margin: 0; }
+ul, ol { padding: 0; list-style: none; }
+button, input, select, textarea { font: inherit; color: inherit; }
+a { color: var(--star); text-underline-offset: 3px; }
+img, video, audio, canvas { max-width: 100%; display: block; }
+:focus-visible { outline: 3px solid var(--focus); outline-offset: 2px; }
+::selection { background: var(--hi); color: var(--on-hi); }
+.sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; }
+.num { font-variant-numeric: tabular-nums; font-feature-settings: 'tnum'; }
+
+/* Type scale: heavy and narrow for signage, normal width for reading */
+.display { font-stretch: 68%; font-weight: 850; letter-spacing: -0.01em; line-height: 0.98; font-size: clamp(2.6rem, 7vw, 5.2rem); }
+.title { font-stretch: 78%; font-weight: 800; letter-spacing: 0; line-height: 1.05; font-size: clamp(1.6rem, 3.2vw, 2.3rem); }
+.h { font-stretch: 85%; font-weight: 750; font-size: 1.2rem; line-height: 1.2; }
+.h-sm { font-weight: 700; font-size: 1rem; line-height: 1.25; }
+.lede { font-size: 1.125rem; line-height: 1.55; color: var(--ink-2); max-width: 56ch; }
+.sub { color: var(--ink-2); font-size: 0.9rem; line-height: 1.45; }
+.fine { color: var(--ink-3); font-size: 0.8rem; line-height: 1.4; }
+.strong { font-weight: 700; }
+.measure { max-width: 62ch; }

@@ -1,7 +1,8 @@
-import { collection, doc, runTransaction, updateDoc, writeBatch, type Firestore, type WriteBatch } from 'firebase/firestore'
+import { arrayRemove, collection, doc, runTransaction, setDoc, updateDoc, writeBatch, type Firestore, type WriteBatch } from 'firebase/firestore'
 import { requiredCapabilities } from './capabilities'
+import { formatReceipt, randomSecret, sha256Hex } from './crypto'
 import { OFFER_TTL_MS, type Candidate, type PlanAction } from './matching'
-import type { Ambulance, Capability, Case, CaseStatus, CaseType, EventKind, Hospital, Offer, Role, Severity, TrackedPos } from './types'
+import type { AiBriefing, Ambulance, Capability, Case, CaseStatus, CaseType, EventKind, Hospital, Offer, Role, Severity, TrackedPos } from './types'
 
 export interface Actor { uid: string; role: Role | 'reporter' }
 const clean = <T extends object>(o: T): T => JSON.parse(JSON.stringify(o)) as T
@@ -27,32 +28,115 @@ export interface NewCaseInput {
   lat: number
   lng: number
   locationSource: 'gps' | 'manual'
+  /** How many evidence files the reporter intends to attach, so dispatch can see what is still on its way. */
+  evidenceExpected?: number
+}
+
+export interface CreatedCase {
+  id: string
+  /** Secret receipt code "<caseId>.<secret>". Shown to the reporter; only the hash of the secret is stored. */
+  receipt: string
+  /** Settles when the server confirms the write. While offline it stays pending and the report is only on this device. */
+  done: Promise<void>
 }
 
 export async function createCase(db: Firestore, actor: Actor, i: NewCaseInput, now = Date.now()): Promise<string> {
-  const q = createCaseQueued(db, actor, i, now)
-  await q.done
-  return q.id
+  const c = await createCaseQueued(db, actor, i, now)
+  await c.done
+  return c.id
 }
 
-/** Returns the new case id immediately; `done` settles when the server confirms (never, while offline: the write stays queued on the device). */
-export function createCaseQueued(db: Firestore, actor: Actor, i: NewCaseInput, now = Date.now()): { id: string; done: Promise<void> } {
+export async function createCaseQueued(db: Firestore, actor: Actor, i: NewCaseInput, now = Date.now()): Promise<CreatedCase> {
   const ref = doc(collection(db, 'cases'))
+  const secret = randomSecret()
+  const receiptHash = await sha256Hex(secret)
   const b = writeBatch(db)
   b.set(ref, {
     type: i.type, severity: i.severity, patients: i.patients, needsIcu: i.needsIcu, brief: i.brief.slice(0, 160), locationSource: i.locationSource,
     reporterUid: actor.uid, createdAtMs: now, status: 'reported', requiredCapabilities: requiredCapabilities(i.type, i.needsIcu), lat: i.lat, lng: i.lng,
-    ambulanceId: null, ambulanceCallSign: null, ambulanceAckAtMs: null, ambulancePos: null, etaSceneMin: null, etaSource: null, dispatchedAtMs: null,
-    notifiedHospitalIds: [], offerWave: 0, recommendedHospitalId: null, selectedHospitalId: null, selectedHospitalName: null, selectedAtMs: null,
-    selectedByUid: null, overrideReason: null, escalation: 'none', escalationNote: null, duplicateOf: null, duplicateDismissed: false,
-    arrivalConfirmedAtMs: null, arrivalConfirmedByUid: null, closedAtMs: null, closeReason: null,
+    ambulanceId: null, ambulanceCallSign: null, ambulanceAckAtMs: null, crewOfferedAtMs: null, declinedAmbulanceIds: [], crewDeclineReason: null,
+    ambulancePos: null, etaSceneMin: null, etaSource: null, dispatchedAtMs: null, notifiedHospitalIds: [], activeHospitalIds: [], hospitalAlertAtMs: null,
+    offerWave: 0, recommendedHospitalId: null, selectedHospitalId: null, selectedHospitalName: null, selectedAtMs: null, selectedByUid: null, overrideReason: null,
+    destinationAckAtMs: null, destinationAckByUid: null, pickupAtMs: null, escalation: 'none', escalationNote: null, duplicateOf: null, duplicateDismissed: false,
+    arrivalConfirmedAtMs: null, arrivalConfirmedByUid: null, closedAtMs: null, closeReason: null, receiptHash, evidenceExpected: Math.min(10, i.evidenceExpected ?? 0),
   })
   b.set(doc(db, 'cases', ref.id, 'private', 'patient'), { contact: i.contact.slice(0, 40), note: i.note.slice(0, 500), reporterUid: actor.uid })
   addEvent(db, b, ref.id, actor, null, 'reported', 'Emergency reported', now)
-  return { id: ref.id, done: b.commit() }
+  return { id: ref.id, receipt: formatReceipt(ref.id, secret), done: b.commit() }
 }
 
-// ---------------------------------------------------------------- dispatch
+/** Open a case on another device by proving possession of its receipt code. */
+export async function claimCase(db: Firestore, actor: Actor, caseId: string, secret: string, now = Date.now()): Promise<void> {
+  await setDoc(doc(db, 'cases', caseId, 'claims', actor.uid), { secret, claimedAtMs: now })
+}
+
+// ---------------------------------------------------------------- dispatch: offer the case to a crew
+
+export interface DispatchInput {
+  ambulance: Ambulance
+  etaSceneMin: number
+  etaSource: 'road' | 'estimate'
+}
+
+/**
+ * Step 1 of dispatch: the dispatcher explicitly offers the case to one available ambulance. The unit is reserved in the
+ * same transaction (it can hold only one case), but nothing is promised to hospitals until the crew ACCEPTS.
+ */
+export async function dispatchCase(db: Firestore, actor: Actor, c: Case, d: DispatchInput, now = Date.now()): Promise<void> {
+  if (c.declinedAmbulanceIds.includes(d.ambulance.id)) throw new Error(`${d.ambulance.callSign} already declined this case`)
+  await runTransaction(db, async (tx) => {
+    const caseRef = doc(db, 'cases', c.id)
+    const ambRef = doc(db, 'ambulances', d.ambulance.id)
+    const [cs, as] = await Promise.all([tx.get(caseRef), tx.get(ambRef)])
+    if (!cs.exists() || cs.data().status !== 'reported') throw new Error('This case has already been offered to a crew')
+    if (!as.exists() || as.data().currentCaseId) throw new Error(`${d.ambulance.callSign} is no longer available`)
+    const pos: TrackedPos = { lat: d.ambulance.lat, lng: d.ambulance.lng, atMs: now, source: 'simulated' }
+    tx.update(caseRef, {
+      status: 'dispatched', ambulanceId: d.ambulance.id, ambulanceCallSign: d.ambulance.callSign, crewOfferedAtMs: now, dispatchedAtMs: now, ambulancePos: pos,
+      etaSceneMin: d.etaSceneMin, etaSource: d.etaSource,
+    })
+    tx.update(ambRef, { available: false, currentCaseId: c.id })
+    tx.set(doc(collection(db, 'cases', c.id, 'events')), {
+      kind: 'dispatched', text: `${d.ambulance.callSign} offered the case (ETA to scene ${d.etaSceneMin} min, ${d.etaSource === 'road' ? 'road routing' : 'estimate'})`,
+      atMs: now, actorUid: actor.uid, actorRole: actor.role,
+    })
+  })
+}
+
+/** The crew accepts the offer. Hospitals are asked next, while the crew drives to the scene. */
+export async function crewAccept(db: Firestore, actor: Actor, c: Case, now = Date.now()): Promise<void> {
+  const b = writeBatch(db)
+  b.update(doc(db, 'cases', c.id), { status: 'enroute', ambulanceAckAtMs: now })
+  addEvent(db, b, c.id, actor, null, 'ack', `${c.ambulanceCallSign} accepted the dispatch and is on the way`, now)
+  await b.commit()
+}
+
+/** The crew declines. The case returns to dispatch, the unit is freed and recorded as having declined. */
+export async function crewDecline(db: Firestore, actor: Actor, c: Case, reason: string, now = Date.now()): Promise<void> {
+  if (!c.ambulanceId) throw new Error('This case is not assigned to your unit')
+  const b = writeBatch(db)
+  b.update(doc(db, 'cases', c.id), {
+    status: 'reported', ambulanceId: null, ambulanceCallSign: null, ambulancePos: null, dispatchedAtMs: null, crewOfferedAtMs: null, etaSceneMin: null, etaSource: null,
+    declinedAmbulanceIds: [...c.declinedAmbulanceIds, c.ambulanceId], crewDeclineReason: reason.slice(0, 120),
+  })
+  b.update(doc(db, 'ambulances', c.ambulanceId), { available: true, currentCaseId: null })
+  addEvent(db, b, c.id, actor, null, 'crew_declined', `${c.ambulanceCallSign} declined: ${reason}`, now)
+  await b.commit()
+}
+
+/** Dispatcher takes back an offer the crew has not answered. */
+export async function cancelAssignment(db: Firestore, actor: Actor, c: Case, reason: string, now = Date.now()): Promise<void> {
+  if (c.status !== 'dispatched' || !c.ambulanceId) throw new Error('Only an unanswered offer can be taken back')
+  const b = writeBatch(db)
+  b.update(doc(db, 'cases', c.id), {
+    status: 'reported', ambulanceId: null, ambulanceCallSign: null, ambulancePos: null, dispatchedAtMs: null, crewOfferedAtMs: null, etaSceneMin: null, etaSource: null, ambulanceAckAtMs: null,
+  })
+  b.update(doc(db, 'ambulances', c.ambulanceId), { available: true, currentCaseId: null })
+  addEvent(db, b, c.id, actor, null, 'assignment_cancelled', `Offer to ${c.ambulanceCallSign} taken back: ${reason}`, now)
+  await b.commit()
+}
+
+// ---------------------------------------------------------------- hospital pre-alert waves
 
 function offerDoc(c: Pick<Case, 'id'>, cand: Candidate, wave: number, now: number, ttl = OFFER_TTL_MS): Omit<Offer, 'id'> {
   return {
@@ -62,38 +146,6 @@ function offerDoc(c: Pick<Case, 'id'>, cand: Candidate, wave: number, now: numbe
   }
 }
 
-export interface DispatchInput {
-  ambulance: Ambulance
-  candidates: Candidate[]
-  etaSceneMin: number
-  etaSource: 'road' | 'estimate'
-  /** Offer deadline; defaults to OFFER_TTL_MS. Overridable for tests only. */
-  ttlMs?: number
-}
-
-/**
- * Assign the ambulance AND ask the nearest eligible hospitals in the same atomic write, so hospital selection
- * runs while the ambulance is already driving to the scene.
- */
-export async function dispatchCase(db: Firestore, actor: Actor, c: Case, d: DispatchInput, now = Date.now()): Promise<void> {
-  await runTransaction(db, async (tx) => {
-    const caseRef = doc(db, 'cases', c.id)
-    const ambRef = doc(db, 'ambulances', d.ambulance.id)
-    const [cs, as] = await Promise.all([tx.get(caseRef), tx.get(ambRef)])
-    if (!cs.exists() || cs.data().status !== 'reported') throw new Error('This case has already been dispatched')
-    if (!as.exists() || as.data().available !== true) throw new Error(`${d.ambulance.callSign} is no longer available`)
-    const pos: TrackedPos = { lat: d.ambulance.lat, lng: d.ambulance.lng, atMs: now, source: 'simulated' }
-    tx.update(caseRef, {
-      status: 'dispatched', ambulanceId: d.ambulance.id, ambulanceCallSign: d.ambulance.callSign, dispatchedAtMs: now, ambulancePos: pos,
-      etaSceneMin: d.etaSceneMin, etaSource: d.etaSource, notifiedHospitalIds: d.candidates.map((x) => x.hospital.id), offerWave: 1,
-    })
-    tx.update(ambRef, { available: false })
-    for (const cand of d.candidates) tx.set(doc(db, 'offers', offerId(c.id, cand.hospital.id)), offerDoc(c, cand, 1, now, d.ttlMs))
-    tx.set(doc(collection(db, 'cases', c.id, 'events')), { kind: 'dispatched', text: `${d.ambulance.callSign} dispatched (ETA to scene ${d.etaSceneMin} min, ${d.etaSource === 'road' ? 'road routing' : 'estimate'})`, atMs: now, actorUid: actor.uid, actorRole: actor.role })
-    tx.set(doc(collection(db, 'cases', c.id, 'events')), { kind: 'offer_sent', text: `Request sent to ${d.candidates.length} hospital(s): ${d.candidates.map((x) => x.hospital.name).join(', ')}`, atMs: now, actorUid: actor.uid, actorRole: actor.role })
-  })
-}
-
 /** Contact the next wave. Guarded by the expected wave number so two dispatcher tabs cannot both do it. */
 export async function contactNextWave(db: Firestore, actor: Actor, c: Case, candidates: Candidate[], wave: number, now = Date.now(), ttlMs?: number): Promise<boolean> {
   return runTransaction(db, async (tx) => {
@@ -101,11 +153,19 @@ export async function contactNextWave(db: Firestore, actor: Actor, c: Case, cand
     const cs = await tx.get(caseRef)
     if (!cs.exists() || cs.data().offerWave !== wave - 1) return false
     const known: string[] = cs.data().notifiedHospitalIds
+    const active: string[] = cs.data().activeHospitalIds
     const fresh = candidates.filter((x) => !known.includes(x.hospital.id))
     if (!fresh.length) return false
-    tx.update(caseRef, { offerWave: wave, notifiedHospitalIds: [...known, ...fresh.map((x) => x.hospital.id)] })
+    tx.update(caseRef, {
+      offerWave: wave,
+      notifiedHospitalIds: [...known, ...fresh.map((x) => x.hospital.id)],
+      activeHospitalIds: [...active, ...fresh.map((x) => x.hospital.id)],
+      hospitalAlertAtMs: cs.data().hospitalAlertAtMs ?? now,
+    })
     for (const cand of fresh) tx.set(doc(db, 'offers', offerId(c.id, cand.hospital.id)), offerDoc(c, cand, wave, now, ttlMs))
-    tx.set(doc(collection(db, 'cases', c.id, 'events')), { kind: 'wave', text: `Wave ${wave}: asked ${fresh.map((x) => x.hospital.name).join(', ')}`, atMs: now, actorUid: actor.uid, actorRole: 'system' })
+    tx.set(doc(collection(db, 'cases', c.id, 'events')), {
+      kind: 'wave', text: `${wave === 1 ? 'Pre-alert' : `Wave ${wave}`}: asked ${fresh.map((x) => x.hospital.name).join(', ')}`, atMs: now, actorUid: actor.uid, actorRole: 'system',
+    })
     return true
   })
 }
@@ -123,9 +183,11 @@ export async function applyPlan(db: Firestore, actor: Actor, c: Case, actions: P
       const caseRef = doc(db, 'cases', c.id)
       if (a.type === 'timeout') {
         for (const id of a.offerIds) b.update(doc(db, 'offers', id), { state: 'timeout' })
+        // A hospital that stayed silent loses access to the case and its evidence.
+        b.update(caseRef, { activeHospitalIds: arrayRemove(...a.offerIds.map((id) => id.slice(c.id.length + 1))) })
         addEvent(db, b, c.id, 'system', actor.uid, 'offer_timeout', `No response from ${a.offerIds.length} hospital(s) before the deadline`, now)
       } else if (a.type === 'clearSelection') {
-        b.update(caseRef, { selectedHospitalId: null, selectedHospitalName: null, selectedAtMs: null, selectedByUid: null, overrideReason: null, escalation: 'attention', escalationNote: a.reason })
+        b.update(caseRef, { selectedHospitalId: null, selectedHospitalName: null, selectedAtMs: null, selectedByUid: null, overrideReason: null, destinationAckAtMs: null, destinationAckByUid: null, escalation: 'attention', escalationNote: a.reason })
         addEvent(db, b, c.id, 'system', actor.uid, 'escalation', `Destination lost: ${a.reason}`, now)
       } else if (a.type === 'recommend') {
         b.update(caseRef, { recommendedHospitalId: a.hospitalId })
@@ -162,12 +224,24 @@ export async function selectDestination(db: Firestore, actor: Actor, c: Case, of
   b.update(doc(db, 'cases', c.id), {
     recommendedHospitalId: recommendedId, selectedHospitalId: hospitalId, selectedHospitalName: chosen.hospitalName, selectedAtMs: now, selectedByUid: actor.uid,
     overrideReason: isOverride ? (overrideReason as string).trim() : null, escalation: 'none', escalationNote: null,
+    destinationAckAtMs: null, destinationAckByUid: null,
+    // Everyone else is withdrawn and loses access; only the destination keeps the case.
+    activeHospitalIds: [hospitalId],
   })
   for (const o of offers) {
     if (o.hospitalId === hospitalId) b.update(doc(db, 'offers', o.id), { state: 'selected' })
     else if (o.state === 'pending' || o.state === 'accepted') b.update(doc(db, 'offers', o.id), { state: 'withdrawn' })
   }
   addEvent(db, b, c.id, actor, null, 'selected', `Destination confirmed: ${chosen.hospitalName}${isOverride ? ` (override: ${overrideReason})` : ' (recommended)'}`, now)
+  await b.commit()
+}
+
+/** The crew confirms it has seen the destination. Transport cannot start before this. */
+export async function acknowledgeDestination(db: Firestore, actor: Actor, c: Case, now = Date.now()): Promise<void> {
+  if (!c.selectedHospitalId) throw new Error('No destination has been confirmed yet')
+  const b = writeBatch(db)
+  b.update(doc(db, 'cases', c.id), { destinationAckAtMs: now, destinationAckByUid: actor.uid })
+  addEvent(db, b, c.id, actor, null, 'destination_ack', `${c.ambulanceCallSign} acknowledged the destination: ${c.selectedHospitalName}`, now)
   await b.commit()
 }
 
@@ -191,6 +265,8 @@ export async function respondToOffer(db: Firestore, actor: Actor, o: Offer, r: O
     state: r.accept ? 'accepted' : 'declined', respondedAtMs: now, respondedByUid: actor.uid,
     confirmations: r.confirmations, canReceive: r.accept ? r.canReceive : false, declineReason: r.accept ? null : (r.declineReason ?? 'Declined'),
   })
+  // Declining ends this hospital's access to the case and its evidence, in the same atomic write.
+  if (!r.accept) b.update(doc(db, 'cases', o.caseId), { activeHospitalIds: arrayRemove(o.hospitalId) })
   addEvent(db, b, o.caseId, actor, null, r.accept ? 'offer_accepted' : 'offer_declined',
     r.accept ? `${o.hospitalName} accepted${r.canReceive ? '' : ' (cannot receive)'}; confirmed: ${Object.entries(r.confirmations).filter(([, v]) => v).map(([k]) => k).join(', ') || 'nothing'}` : `${o.hospitalName} declined: ${r.declineReason ?? 'no reason given'}`, now)
   await b.commit()
@@ -199,6 +275,7 @@ export async function respondToOffer(db: Firestore, actor: Actor, o: Offer, r: O
 export async function revokeOffer(db: Firestore, actor: Actor, o: Offer, reason: string, now = Date.now()): Promise<void> {
   const b = writeBatch(db)
   b.update(doc(db, 'offers', o.id), { state: 'declined', declineReason: reason, respondedAtMs: now, respondedByUid: actor.uid })
+  b.update(doc(db, 'cases', o.caseId), { activeHospitalIds: arrayRemove(o.hospitalId) })
   addEvent(db, b, o.caseId, actor, null, 'offer_revoked', `${o.hospitalName} withdrew its acceptance: ${reason}`, now)
   await b.commit()
 }
@@ -206,7 +283,7 @@ export async function revokeOffer(db: Firestore, actor: Actor, o: Offer, reason:
 export async function confirmArrival(db: Firestore, actor: Actor, c: Case, now = Date.now()): Promise<void> {
   const b = writeBatch(db)
   b.update(doc(db, 'cases', c.id), { arrivalConfirmedAtMs: now, arrivalConfirmedByUid: actor.uid })
-  addEvent(db, b, c.id, actor, null, 'arrival_confirmed', `${c.selectedHospitalName ?? 'Hospital'} confirmed the patient arrived`, now)
+  addEvent(db, b, c.id, actor, null, 'arrival_confirmed', `${c.selectedHospitalName ?? 'Hospital'} confirmed receipt of the patient`, now)
   await b.commit()
 }
 
@@ -219,24 +296,20 @@ export async function confirmAvailability(db: Firestore, actor: Actor, h: Hospit
   await updateDoc(doc(db, 'hospitals', h.id), { availability: clean({ ...a, confirmedAtMs: now, confirmedByUid: actor.uid }) })
 }
 
-// ---------------------------------------------------------------- ambulance actions
+// ---------------------------------------------------------------- crew progress
 
 const NEXT: Partial<Record<CaseStatus, CaseStatus>> = { enroute: 'onscene', onscene: 'transporting', transporting: 'arrived' }
-const STATUS_TEXT: Partial<Record<CaseStatus, string>> = { onscene: 'arrived on scene', transporting: 'departed with the patient', arrived: 'arrived at the hospital' }
-
-export async function acknowledgeAssignment(db: Firestore, actor: Actor, c: Case, now = Date.now()): Promise<void> {
-  const b = writeBatch(db)
-  b.update(doc(db, 'cases', c.id), { status: 'enroute', ambulanceAckAtMs: now })
-  addEvent(db, b, c.id, actor, null, 'ack', `${c.ambulanceCallSign} acknowledged and is on the way`, now)
-  await b.commit()
-}
+const STATUS_TEXT: Partial<Record<CaseStatus, string>> = { onscene: 'arrived on scene', transporting: 'picked up the patient and departed', arrived: 'arrived at the hospital' }
 
 export async function advanceStatus(db: Firestore, actor: Actor, c: Case, pos: TrackedPos | null, now = Date.now()): Promise<void> {
   const next = NEXT[c.status]
   if (!next) throw new Error(`Cannot advance from ${c.status}`)
+  if (next === 'transporting' && !c.destinationAckAtMs) throw new Error('Acknowledge the confirmed destination before leaving the scene')
   const b = writeBatch(db)
-  b.update(doc(db, 'cases', c.id), { status: next, ...(pos ? { ambulancePos: pos } : {}), ...(next === 'onscene' ? { etaSceneMin: 0 } : {}) })
-  addEvent(db, b, c.id, actor, null, 'status', `${c.ambulanceCallSign} ${STATUS_TEXT[next]}`, now)
+  b.update(doc(db, 'cases', c.id), {
+    status: next, ...(pos ? { ambulancePos: pos } : {}), ...(next === 'onscene' ? { etaSceneMin: 0 } : {}), ...(next === 'transporting' ? { pickupAtMs: now } : {}),
+  })
+  addEvent(db, b, c.id, actor, null, next === 'transporting' ? 'pickup' : 'status', `${c.ambulanceCallSign} ${STATUS_TEXT[next]}`, now)
   await b.commit()
 }
 
@@ -246,10 +319,12 @@ export async function reportPosition(db: Firestore, c: Pick<Case, 'id'>, pos: Tr
 
 // ---------------------------------------------------------------- closing
 
+/** Close after the hospital confirmed receipt, or cancel a case that never reached the hospital. Frees the ambulance. */
 export async function closeCase(db: Firestore, actor: Actor, c: Case, reason: string, now = Date.now()): Promise<void> {
+  if (c.status === 'arrived' && !c.arrivalConfirmedAtMs) throw new Error('The hospital has not confirmed receipt of the patient yet')
   const b = writeBatch(db)
   b.update(doc(db, 'cases', c.id), { status: 'closed', closedAtMs: now, closeReason: reason })
-  if (c.ambulanceId) b.update(doc(db, 'ambulances', c.ambulanceId), { available: true })
+  if (c.ambulanceId) b.update(doc(db, 'ambulances', c.ambulanceId), { available: true, currentCaseId: null })
   addEvent(db, b, c.id, actor, null, 'closed', `Case closed: ${reason}`, now)
   await b.commit()
 }
@@ -257,11 +332,25 @@ export async function closeCase(db: Firestore, actor: Actor, c: Case, reason: st
 export async function markDuplicate(db: Firestore, actor: Actor, c: Case, ofCase: Case, now = Date.now()): Promise<void> {
   const b = writeBatch(db)
   b.update(doc(db, 'cases', c.id), { duplicateOf: ofCase.id, status: 'closed', closedAtMs: now, closeReason: 'Duplicate report' })
-  if (c.ambulanceId) b.update(doc(db, 'ambulances', c.ambulanceId), { available: true })
+  if (c.ambulanceId) b.update(doc(db, 'ambulances', c.ambulanceId), { available: true, currentCaseId: null })
   addEvent(db, b, c.id, actor, null, 'duplicate', `Marked as duplicate of case ${ofCase.id.slice(0, 6)}`, now)
   await b.commit()
 }
 
 export async function dismissDuplicate(db: Firestore, c: Case): Promise<void> {
   await updateDoc(doc(db, 'cases', c.id), { duplicateDismissed: true })
+}
+
+// ---------------------------------------------------------------- AI briefing (draft for dispatch, reviewed handoff for others)
+
+export async function saveAiDraft(db: Firestore, caseId: string, b: AiBriefing): Promise<void> {
+  await setDoc(doc(db, 'cases', caseId, 'ai', 'draft'), clean(b))
+}
+
+/** The dispatcher reviews (and may correct) the AI draft, then shares it with the crew and active hospitals. */
+export async function shareHandoff(db: Firestore, actor: Actor, caseId: string, b: AiBriefing, now = Date.now()): Promise<void> {
+  const batch = writeBatch(db)
+  batch.set(doc(db, 'cases', caseId, 'ai', 'handoff'), clean({ ...b, reviewedByUid: actor.uid, reviewedAtMs: now }))
+  addEvent(db, batch, caseId, actor, null, 'ai', `AI-assisted handoff reviewed${b.edited ? ' and corrected' : ''} by dispatch and shared`, now)
+  await batch.commit()
 }

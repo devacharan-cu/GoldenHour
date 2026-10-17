@@ -41,6 +41,12 @@ export async function startWorld(): Promise<RulesTestEnvironment> {
   return env
 }
 export const stopWorld = () => env.cleanup()
+/** Run something with security rules disabled (test setup and deliberate tampering only). */
+export async function withAdmin<T>(fn: (db: Firestore) => Promise<T>): Promise<T> {
+  let out: T | undefined
+  await env.withSecurityRulesDisabled(async (ctx) => { out = await fn(ctx.firestore() as unknown as Firestore) })
+  return out as T
+}
 
 export async function resetWorld(): Promise<void> {
   await env.clearFirestore()
@@ -50,7 +56,7 @@ export async function resetWorld(): Promise<void> {
     for (const h of worldHospitals()) { const { id, ...rest } = h; await setDoc(doc(db, 'hospitals', id), rest) }
     for (const a of [mkAmbulance('a1', 12.869, 74.84), mkAmbulance('a2', 12.9, 74.85), mkAmbulance('a3', 12.95, 74.85)]) {
       const { id, ...rest } = a
-      await setDoc(doc(db, 'ambulances', id), { ...rest, callSign: `Medic ${id.slice(1)}` })
+      await setDoc(doc(db, 'ambulances', id), { ...rest, callSign: `Medic ${id.slice(1)}`, available: true, currentCaseId: null })
     }
   })
 }

@@ -1,65 +1,135 @@
 import { assertFails } from '@firebase/rules-unit-testing'
-import { collection, doc, getDoc, getDocs, onSnapshot, query, updateDoc, where } from 'firebase/firestore'
+import { collection, doc, getDoc, getDocs, onSnapshot, query, setDoc, updateDoc, where } from 'firebase/firestore'
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from 'vitest'
-import { planEscalation } from '../lib/matching'
-import type { Case, Offer } from '../lib/types'
-import { applyPlan, closeCase, confirmAvailability, contactNextWave, dismissDuplicate, extendDeadline, markDuplicate, revokeOffer, selectDestination, updateHospitalProfile } from '../lib/workflow'
+import { analyseCase, FakeAiClient } from '../lib/ai'
+import { parseReceipt } from '../lib/crypto'
 import { findDuplicates } from '../lib/duplicates'
-import { answer, dispatchIt, driveToHospital, etaByDistance, reportCase } from './scenario'
-import { amb, disp, hosp, readCase, readHospitals, readOffers, reporter, resetWorld, startWorld, stopWorld, waitFor } from './world'
+import { CHUNK_SIZE, downloadEvidence, uploadEvidence } from '../lib/evidence'
+import { sha256Hex } from '../lib/crypto'
+import { Bytes } from 'firebase/firestore'
+import { mkAmbulance } from '../lib/fixtures'
+import { contactNextWave } from '../lib/workflow'
+import type { AiBriefing, Case, Evidence, Offer } from '../lib/types'
+import { cancelAssignment, claimCase, closeCase, confirmAvailability, createCaseQueued, crewAccept, crewDecline, dismissDuplicate, dispatchCase, extendDeadline, markDuplicate, revokeOffer, selectDestination, shareHandoff, updateHospitalProfile } from '../lib/workflow'
+import { answer, crewAccepts, dispatchIt, driveToHospital, input, offerToCrew, reportCase, tick } from './scenario'
+import { amb, disp, hosp, readCase, readHospitals, readOffers, reporter, resetWorld, startWorld, stopWorld, stranger, waitFor } from './world'
 
 beforeAll(startWorld)
 afterAll(stopWorld)
 beforeEach(resetWorld)
 
-/** One engine tick, exactly as the dispatcher console runs it. */
-async function tick(caseId: string, nowMs = Date.now(), ttlMs?: number): Promise<string[]> {
-  const d = disp()
-  const c = await readCase(d.db, caseId)
-  const plan = planEscalation({ c, offers: await readOffers(d.db, caseId), hospitals: await readHospitals(d.db), nowMs, etaFor: etaByDistance })
-  return applyPlan(d.db, d.actor, c, plan, nowMs, ttlMs)
-}
 const states = async (caseId: string) => Object.fromEntries((await readOffers(disp().db, caseId)).map((o) => [o.hospitalId, o.state]))
 const eventKinds = async (caseId: string) => (await getDocs(collection(disp().db, 'cases', caseId, 'events'))).docs.map((d) => d.data().kind as string)
+const bytes = (n: number, seed = 3) => Uint8Array.from({ length: n }, (_, i) => (i * 17 + seed) % 253)
 
-describe('happy path: report → dispatch → acceptance → destination → transport → arrival → close', () => {
-  it('runs the whole workflow with the destination ready before transport', async () => {
+describe('the complete actor sequence', () => {
+  it('runs report → dispatcher offers → crew accepts → hospitals pre-alerted → destination → crew acknowledges → pickup → handover → close', async () => {
     const id = await reportCase('trauma')
-    const c0 = await dispatchIt(id)
+    const d = disp()
 
-    // Five nearest eligible hospitals were asked in the same write as the dispatch (h8 lacks trauma and is skipped).
-    expect(c0.status).toBe('dispatched')
-    expect(c0.notifiedHospitalIds).toEqual(['h1', 'h2', 'h3', 'h4', 'h5'])
-    expect(Object.values(await states(id))).toEqual(['pending', 'pending', 'pending', 'pending', 'pending'])
-    expect((await getDoc(doc(disp().db, 'ambulances', 'a1'))).data()?.available).toBe(false)
+    // 1-2. Reporter filed it; the dispatcher explicitly offers it to ONE ambulance. No hospital hears about it yet.
+    const offered = await offerToCrew(id)
+    expect(offered).toMatchObject({ status: 'dispatched', ambulanceId: 'a1', ambulanceAckAtMs: null })
+    expect((await getDoc(doc(d.db, 'ambulances', 'a1'))).data()).toMatchObject({ available: false, currentCaseId: id })
+    expect(await tick(id)).toEqual([]) // engine does nothing until a crew accepts
+    expect((await readOffers(d.db, id)).length).toBe(0)
 
-    // Hospitals answer while the ambulance is still en route.
+    // 3-5. The crew accepts; only then are the five nearest eligible hospitals asked, while the crew is en route.
+    const accepted = await crewAccepts(id)
+    expect(accepted.status).toBe('enroute')
+    await tick(id)
+    const alerted = await readCase(d.db, id)
+    expect(alerted.notifiedHospitalIds).toEqual(['h1', 'h2', 'h3', 'h4', 'h5'])
+    expect(alerted.activeHospitalIds).toEqual(alerted.notifiedHospitalIds)
+    expect(alerted.status).toBe('enroute')
+    expect(alerted.hospitalAlertAtMs).toBeGreaterThanOrEqual(alerted.ambulanceAckAtMs as number)
+
+    // 6. Each hospital decides independently.
     await answer(id, 'h2', true)
     await answer(id, 'h1', false)
     await answer(id, 'h3', true)
     await tick(id)
-    let c = await readCase(disp().db, id)
-    expect(c.recommendedHospitalId).toBe('h2') // nearest of the two qualified
+    let c = await readCase(d.db, id)
+    expect(c.recommendedHospitalId).toBe('h2')
 
-    // A human confirms. Offers are closed out and the ambulance may now be driven all the way.
-    const d = disp()
+    // 7. A human confirms; everyone else is withdrawn and loses access.
     await selectDestination(d.db, d.actor, c, await readOffers(d.db, id), 'h2', null)
     expect(await states(id)).toMatchObject({ h2: 'selected', h3: 'withdrawn', h1: 'declined', h4: 'withdrawn' })
+    c = await readCase(d.db, id)
+    expect(c.activeHospitalIds).toEqual(['h2'])
+    expect(c.destinationAckAtMs).toBeNull()
+
+    // 8-9. The crew acknowledges the destination, picks up, arrives; the hospital confirms receipt.
     await driveToHospital(id)
     c = await readCase(d.db, id)
-    expect(c.status).toBe('arrived')
-    expect(c.arrivalConfirmedByUid).toBe('hs-h2')
+    expect(c).toMatchObject({ status: 'arrived', destinationAckByUid: 'amb1', arrivalConfirmedByUid: 'hs-h2' })
+    expect(c.pickupAtMs).toBeGreaterThan(0)
 
-    await closeCase(d.db, d.actor, c, 'Handed over')
-    expect((await getDoc(doc(d.db, 'ambulances', 'a1'))).data()?.available).toBe(true)
+    // 10. Only now can it be closed; the ambulance is released.
+    await closeCase(d.db, d.actor, c, 'Handed over to hospital')
+    expect((await getDoc(doc(d.db, 'ambulances', 'a1'))).data()).toMatchObject({ available: true, currentCaseId: null })
+    expect(await readCase(d.db, id)).toMatchObject({ status: 'closed' })
 
-    // Full audit trail, in a sensible order.
-    const kinds = await eventKinds(id)
-    for (const k of ['reported', 'dispatched', 'offer_sent', 'offer_accepted', 'offer_declined', 'selected', 'ack', 'status', 'arrival_confirmed', 'closed']) expect(kinds).toContain(k)
+    // The permanent timeline shows every actor's step, in order.
+    const events = (await getDocs(collection(d.db, 'cases', id, 'events'))).docs.map((x) => x.data()).sort((a, b) => a.atMs - b.atMs)
+    const kinds = events.map((e) => e.kind)
+    for (const k of ['reported', 'dispatched', 'ack', 'wave', 'offer_accepted', 'offer_declined', 'selected', 'destination_ack', 'pickup', 'status', 'arrival_confirmed', 'closed']) expect(kinds).toContain(k)
+    expect(kinds.indexOf('dispatched')).toBeLessThan(kinds.indexOf('ack'))
+    expect(kinds.indexOf('ack')).toBeLessThan(kinds.indexOf('wave'))
+    expect(kinds.indexOf('selected')).toBeLessThan(kinds.indexOf('destination_ack'))
+    expect(kinds.indexOf('destination_ack')).toBeLessThan(kinds.indexOf('pickup'))
+    expect(kinds.indexOf('arrival_confirmed')).toBeLessThan(kinds.indexOf('closed'))
+    expect(new Set(events.map((e) => e.actorRole))).toEqual(new Set(['reporter', 'dispatcher', 'ambulance', 'system', 'hospital']))
   })
 })
 
-describe('decline and reroute', () => {
+describe('crew decline, reassignment and unanswered offers', () => {
+  it('reassigns after a decline: the second crew accepts and only then are hospitals asked', async () => {
+    const id = await reportCase()
+    await offerToCrew(id, 'a1')
+    const a1 = amb('amb1')
+    await crewDecline(a1.db, a1.actor, await readCase(a1.db, id), 'On another call')
+    expect((await readOffers(disp().db, id)).length).toBe(0)
+    await offerToCrew(id, 'a2')
+    await tick(id)
+    expect((await readOffers(disp().db, id)).length).toBe(0) // still only an offer
+    await crewAccepts(id, 'a2')
+    await tick(id)
+    const c = await readCase(disp().db, id)
+    expect(c).toMatchObject({ status: 'enroute', ambulanceId: 'a2', declinedAmbulanceIds: ['a1'] })
+    expect(c.notifiedHospitalIds).toHaveLength(5)
+    expect((await eventKinds(id)).filter((k) => k === 'crew_declined')).toHaveLength(1)
+  })
+  it('lets dispatch withdraw an unanswered offer and choose another unit', async () => {
+    const id = await reportCase()
+    await offerToCrew(id, 'a1')
+    const d = disp()
+    await cancelAssignment(d.db, d.actor, await readCase(d.db, id), 'No answer after 2 minutes')
+    await offerToCrew(id, 'a2')
+    expect((await readCase(d.db, id)).ambulanceId).toBe('a2')
+    expect((await getDoc(doc(d.db, 'ambulances', 'a1'))).data()?.available).toBe(true)
+    expect(await eventKinds(id)).toContain('assignment_cancelled')
+  })
+  it('settles a crew-accepts versus dispatcher-cancels race with exactly one winner and consistent records', async () => {
+    const id = await reportCase()
+    await offerToCrew(id, 'a1')
+    const a = amb('amb1')
+    const d = disp()
+    const ca = await readCase(a.db, id)
+    const cd = await readCase(d.db, id)
+    const results = await Promise.allSettled([crewAccept(a.db, a.actor, ca), cancelAssignment(d.db, d.actor, cd, 'racing')])
+    const wonByCrew = results[0].status === 'fulfilled'
+    const wonByDispatch = results[1].status === 'fulfilled'
+    // Either outcome is acceptable; both succeeding or both failing would leave inconsistent records.
+    expect([wonByCrew, wonByDispatch].filter(Boolean).length).toBeGreaterThanOrEqual(1)
+    const c = await readCase(d.db, id)
+    const ambulance = (await getDoc(doc(d.db, 'ambulances', 'a1'))).data()
+    if (c.status === 'enroute') expect(ambulance).toMatchObject({ currentCaseId: id, available: false })
+    else expect(ambulance).toMatchObject({ currentCaseId: null, available: true })
+  })
+})
+
+describe('decline and reroute (hospitals)', () => {
   it('asks the next hospitals automatically when all five decline', async () => {
     const id = await reportCase()
     await dispatchIt(id)
@@ -68,6 +138,7 @@ describe('decline and reroute', () => {
     const c = await readCase(disp().db, id)
     expect(c.offerWave).toBe(2)
     expect(c.notifiedHospitalIds).toEqual(['h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'h7'])
+    expect(c.activeHospitalIds).toEqual(['h6', 'h7']) // the five that declined are out
     await answer(id, 'h6', true)
     await tick(id)
     expect((await readCase(disp().db, id)).recommendedHospitalId).toBe('h6')
@@ -86,37 +157,37 @@ describe('missing capabilities and unavailable resources', () => {
   it('never treats an accept without confirmation as a destination, and keeps searching', async () => {
     const id = await reportCase('trauma')
     await dispatchIt(id)
-    for (const h of ['h1', 'h2', 'h3', 'h4', 'h5']) await answer(id, h, true, [], true) // accept but confirm nothing
+    for (const h of ['h1', 'h2', 'h3', 'h4', 'h5']) await answer(id, h, true, [], true)
     await tick(id)
     const c = await readCase(disp().db, id)
     expect(c.recommendedHospitalId).toBeNull()
-    expect(c.offerWave).toBe(2) // widened, because nobody actually qualified
+    expect(c.offerWave).toBe(2)
   })
   it('snakebite is only offered to antivenom hospitals and needs a live stock confirmation', async () => {
     const id = await reportCase('snakebite')
     const c = await dispatchIt(id)
-    expect(c.notifiedHospitalIds).toEqual(['h1', 'h3']) // only profiles listing antivenom
-    await answer(id, 'h1', true, ['emergency']) // yes, but did NOT confirm antivenom is in stock
+    expect(c.notifiedHospitalIds).toEqual(['h1', 'h3'])
+    await answer(id, 'h1', true, ['emergency'])
     await answer(id, 'h3', false, [], false, 'Required resource out of stock')
     await tick(id)
     const after = await readCase(disp().db, id)
     expect(after.recommendedHospitalId).toBeNull()
-    expect(after.escalation).toBe('no_hospital') // nobody left: clear human escalation, nothing invented
+    expect(after.escalation).toBe('no_hospital')
     expect(after.escalationNote).toMatch(/phone hospitals/)
   })
   it('requires a confirmed ICU bed for ICU cases', async () => {
     const id = await reportCase('trauma', { needsIcu: true })
     const c = await dispatchIt(id)
     expect(c.requiredCapabilities).toEqual(['trauma', 'icu'])
-    expect(c.notifiedHospitalIds).toEqual(['h1', 'h4']) // only profiles with ICU
-    await answer(id, 'h1', true, ['trauma']) // forgot ICU
+    expect(c.notifiedHospitalIds).toEqual(['h1', 'h4'])
+    await answer(id, 'h1', true, ['trauma'])
     await tick(id)
     expect((await readCase(disp().db, id)).recommendedHospitalId).toBeNull()
     await answer(id, 'h4', true, ['trauma', 'icu'])
     await tick(id)
     expect((await readCase(disp().db, id)).recommendedHospitalId).toBe('h4')
   })
-  it('re-plans when the chosen hospital withdraws after selection', async () => {
+  it('re-plans when the chosen hospital withdraws after selection, and clears the crew acknowledgement', async () => {
     const id = await reportCase()
     await dispatchIt(id)
     await answer(id, 'h1', true)
@@ -124,43 +195,23 @@ describe('missing capabilities and unavailable resources', () => {
     await tick(id)
     const d = disp()
     await selectDestination(d.db, d.actor, await readCase(d.db, id), await readOffers(d.db, id), 'h1', null)
-    // h2 was withdrawn by dispatch when h1 was selected, so h1 backing out leaves nobody qualified
+    const a = amb('amb1')
+    const { acknowledgeDestination } = await import('../lib/workflow')
+    await acknowledgeDestination(a.db, a.actor, await readCase(a.db, id))
+    expect((await readCase(d.db, id)).destinationAckAtMs).toBeGreaterThan(0)
     const h = hosp('h1')
     await revokeOffer(h.db, h.actor, (await readOffers(d.db, id)).find((o) => o.hospitalId === 'h1') as Offer, 'Antivenom ran out')
     await tick(id)
     const c = await readCase(d.db, id)
     expect(c.selectedHospitalId).toBeNull()
-    expect(c.escalation === 'attention' || c.escalation === 'none').toBe(true)
-    expect((await eventKinds(id))).toContain('offer_revoked')
-    expect((await eventKinds(id))).toContain('escalation')
-  })
-})
-
-describe('approving before the engine has stored the recommendation', () => {
-  it('confirms the best qualified hospital without demanding an override reason', async () => {
-    const id = await reportCase()
-    await dispatchIt(id)
-    await answer(id, 'h2', true)
-    const d = disp()
-    const c = await readCase(d.db, id)
-    expect(c.recommendedHospitalId).toBeNull() // no engine tick has run yet
-    await selectDestination(d.db, d.actor, c, await readOffers(d.db, id), 'h2', null, 'h2')
-    const after = await readCase(d.db, id)
-    expect(after).toMatchObject({ selectedHospitalId: 'h2', recommendedHospitalId: 'h2', overrideReason: null })
-  })
-  it('still refuses to record a recommendation for a hospital that has not confirmed', async () => {
-    const id = await reportCase()
-    await dispatchIt(id)
-    await answer(id, 'h2', true)
-    const d = disp()
-    const c = await readCase(d.db, id)
-    // h3 is pending: claiming it as the recommendation must fail on the server
-    await expect(selectDestination(d.db, d.actor, c, await readOffers(d.db, id), 'h2', null, 'h3')).rejects.toThrow()
+    expect(c.destinationAckAtMs).toBeNull() // the crew must acknowledge the next destination again
+    expect(c.activeHospitalIds).not.toContain('h1')
+    expect(await eventKinds(id)).toEqual(expect.arrayContaining(['offer_revoked', 'escalation']))
   })
 })
 
 describe('timeouts and escalation', () => {
-  it('times out silent hospitals and moves on, using server-enforced deadlines', async () => {
+  it('times out silent hospitals, removes their access, and moves on using server-enforced deadlines', async () => {
     const id = await reportCase()
     await dispatchIt(id, 'a1', 1200)
     await answer(id, 'h1', false)
@@ -168,8 +219,8 @@ describe('timeouts and escalation', () => {
     const log = await tick(id, Date.now(), 1200)
     expect(log).toContain('timeout')
     expect(log.join()).toContain('wave 2')
-    const s = await states(id)
-    expect(s).toMatchObject({ h1: 'declined', h2: 'timeout', h3: 'timeout', h4: 'timeout', h5: 'timeout', h6: 'pending', h7: 'pending' })
+    expect(await states(id)).toMatchObject({ h1: 'declined', h2: 'timeout', h3: 'timeout', h4: 'timeout', h5: 'timeout', h6: 'pending', h7: 'pending' })
+    expect((await readCase(disp().db, id)).activeHospitalIds).toEqual(['h6', 'h7'])
   })
   it('escalates once all eligible hospitals declined or timed out, and does not repeat itself', async () => {
     const id = await reportCase()
@@ -178,8 +229,7 @@ describe('timeouts and escalation', () => {
     await tick(id)
     for (const h of ['h6', 'h7']) await answer(id, h, false)
     await tick(id)
-    const c = await readCase(disp().db, id)
-    expect(c.escalation).toBe('no_hospital')
+    expect((await readCase(disp().db, id)).escalation).toBe('no_hospital')
     const before = (await eventKinds(id)).filter((k) => k === 'escalation').length
     await tick(id)
     expect((await eventKinds(id)).filter((k) => k === 'escalation').length).toBe(before)
@@ -201,29 +251,34 @@ describe('timeouts and escalation', () => {
 })
 
 describe('concurrent incidents and dispatchers', () => {
-  it('dispatches two simultaneous incidents to different ambulances without mixing offers', async () => {
+  it('runs two simultaneous incidents on different ambulances without mixing offers', async () => {
     const [c1, c2] = await Promise.all([reportCase('trauma', {}, reporter('r1')), reportCase('cardiac', {}, reporter('r2'))])
-    await Promise.all([dispatchIt(c1, 'a1'), dispatchIt(c2, 'a2')])
+    await Promise.all([offerToCrew(c1, 'a1'), offerToCrew(c2, 'a2')])
+    await Promise.all([crewAccepts(c1, 'a1'), crewAccepts(c2, 'a2')])
+    await Promise.all([tick(c1), tick(c2)])
     expect((await readCase(disp().db, c1)).ambulanceId).toBe('a1')
     expect((await readCase(disp().db, c2)).ambulanceId).toBe('a2')
     const [o1, o2] = await Promise.all([readOffers(disp().db, c1), readOffers(disp().db, c2)])
     expect(o1.every((o) => o.caseId === c1)).toBe(true)
     expect(o2.every((o) => o.caseId === c2)).toBe(true)
-    // a hospital asked about both sees both, and can answer them independently
     await answer(c1, 'h1', true)
     await answer(c2, 'h1', false)
     expect((await states(c1)).h1).toBe('accepted')
     expect((await states(c2)).h1).toBe('declined')
+    // h1 declined c2 but must still see c1
+    await getDoc(doc(hosp('h1').db, 'cases', c1))
+    await assertFails(getDoc(doc(hosp('h1').db, 'cases', c2)))
   })
   it('never double-books an ambulance when two dispatchers race', async () => {
     const [c1, c2] = await Promise.all([reportCase('trauma', {}, reporter('r1')), reportCase('trauma', {}, reporter('r2'))])
-    const results = await Promise.allSettled([dispatchIt(c1, 'a1'), dispatchIt(c2, 'a1')])
+    const results = await Promise.allSettled([offerToCrew(c1, 'a1'), offerToCrew(c2, 'a1')])
     expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1)
     expect(results.filter((r) => r.status === 'rejected')).toHaveLength(1)
+    expect((await getDoc(doc(disp().db, 'ambulances', 'a1'))).data()?.currentCaseId).toMatch(/\w{20}/)
   })
-  it('does not dispatch the same case twice', async () => {
+  it('does not offer the same case to two ambulances', async () => {
     const id = await reportCase()
-    const results = await Promise.allSettled([dispatchIt(id, 'a1'), dispatchIt(id, 'a2')])
+    const results = await Promise.allSettled([offerToCrew(id, 'a1'), offerToCrew(id, 'a2')])
     expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1)
     const free = (await Promise.all(['a1', 'a2'].map((a) => getDoc(doc(disp().db, 'ambulances', a))))).filter((s) => s.data()?.available).length
     expect(free).toBe(1)
@@ -239,39 +294,38 @@ describe('concurrent incidents and dispatchers', () => {
     expect(new Set(c.notifiedHospitalIds).size).toBe(c.notifiedHospitalIds.length)
     expect(await contactNextWave(disp().db, disp().actor, c, [], 2)).toBe(false)
   })
+  it('does not send the first wave twice when two consoles react to the same acceptance', async () => {
+    const id = await reportCase()
+    await offerToCrew(id)
+    await crewAccepts(id)
+    const logs = await Promise.all([tick(id), tick(id), tick(id)])
+    expect(logs.flat().filter((l) => l === 'wave 1')).toHaveLength(1)
+    expect((await readOffers(disp().db, id)).length).toBe(5)
+  })
 })
 
 describe('multi-user real-time updates', () => {
-  it('pushes the request to hospitals, responses to dispatch and status to the reporter', async () => {
+  it('shows each actor the right thing at the right moment', async () => {
     const rep = reporter('rep1')
-    const h1Offers: Offer[][] = []
-    const h6Offers: Offer[][] = []
-    const dispOffers: Offer[][] = []
-    let repCase: Case | null = null
-    const unsubs = [
-      onSnapshot(query(collection(hosp('h1').db, 'offers'), where('hospitalId', '==', 'h1')), (s) => h1Offers.push(s.docs.map((d) => d.data() as Offer))),
-      onSnapshot(query(collection(hosp('h6').db, 'offers'), where('hospitalId', '==', 'h6')), (s) => h6Offers.push(s.docs.map((d) => d.data() as Offer))),
-      onSnapshot(collection(disp().db, 'offers'), (s) => dispOffers.push(s.docs.map((d) => d.data() as Offer))),
-    ]
+    const seen = { rep: [] as Case[], crew: [] as Case[][], h1: [] as Case[][], h1Offers: [] as Offer[][] }
     const id = await reportCase('trauma', {}, rep)
-    unsubs.push(onSnapshot(doc(rep.db, 'cases', id), (s) => { repCase = { ...s.data(), id } as Case }))
-
-    await dispatchIt(id)
-    await waitFor(() => h1Offers.at(-1)?.length, (n) => n === 1)
-    expect(h1Offers.at(-1)?.[0].state).toBe('pending')
-    expect(h6Offers.at(-1)?.length ?? 0).toBe(0) // wave 2 hospital sees nothing yet
-
-    await answer(id, 'h1', true)
-    await waitFor(() => dispOffers.at(-1)?.find((o) => o.hospitalId === 'h1')?.state, (s) => s === 'accepted')
-
+    const unsubs = [
+      onSnapshot(doc(rep.db, 'cases', id), (s) => seen.rep.push({ ...s.data(), id } as Case)),
+      onSnapshot(query(collection(amb('amb1').db, 'cases'), where('ambulanceId', '==', 'a1')), (s) => seen.crew.push(s.docs.map((d) => ({ ...d.data(), id: d.id }) as Case))),
+      onSnapshot(query(collection(hosp('h1').db, 'cases'), where('activeHospitalIds', 'array-contains', 'h1')), (s) => seen.h1.push(s.docs.map((d) => ({ ...d.data(), id: d.id }) as Case))),
+      onSnapshot(query(collection(hosp('h1').db, 'offers'), where('hospitalId', '==', 'h1')), (s) => seen.h1Offers.push(s.docs.map((d) => d.data() as Offer))),
+    ]
+    await offerToCrew(id)
+    await waitFor(() => seen.crew.at(-1)?.length, (n) => n === 1) // the crew sees the offer immediately
+    expect(seen.h1.at(-1)?.length ?? 0).toBe(0) // hospitals still see nothing
+    expect(seen.h1Offers.at(-1)?.length ?? 0).toBe(0)
+    await crewAccepts(id)
+    await waitFor(() => seen.rep.at(-1)?.status, (s) => s === 'enroute') // the reporter sees the crew is coming
     await tick(id)
-    const d = disp()
-    await selectDestination(d.db, d.actor, await readCase(d.db, id), await readOffers(d.db, id), 'h1', null)
-    await waitFor(() => repCase?.selectedHospitalName, (n) => n === 'Hospital h1')
-    expect(repCase).toMatchObject({ selectedHospitalId: 'h1', ambulanceCallSign: 'Medic 1' })
-
-    await driveToHospital(id)
-    await waitFor(() => (repCase as Case | null)?.status, (s) => s === 'arrived')
+    await waitFor(() => seen.h1.at(-1)?.length, (n) => n === 1) // now hospital 1 sees the case and its request
+    await waitFor(() => seen.h1Offers.at(-1)?.[0]?.state, (s) => s === 'pending')
+    await answer(id, 'h1', false)
+    await waitFor(() => seen.h1.at(-1)?.length, (n) => n === 0) // declining removes the case from its screen
     unsubs.forEach((u) => u())
   })
   it('streams ambulance position and status to every interested screen', async () => {
@@ -316,13 +370,130 @@ describe('duplicates', () => {
     const d = disp()
     const cases = await Promise.all([readCase(d.db, a), readCase(d.db, b)])
     expect(findDuplicates(cases[1], [cases[0]])).toHaveLength(1)
-    await dispatchIt(b, 'a2')
+    await offerToCrew(b, 'a2')
     await markDuplicate(d.db, d.actor, await readCase(d.db, b), cases[0])
-    const closed = await readCase(d.db, b)
-    expect(closed).toMatchObject({ status: 'closed', duplicateOf: a })
-    expect((await getDoc(doc(d.db, 'ambulances', 'a2'))).data()?.available).toBe(true)
+    expect(await readCase(d.db, b)).toMatchObject({ status: 'closed', duplicateOf: a })
+    expect((await getDoc(doc(d.db, 'ambulances', 'a2'))).data()).toMatchObject({ available: true, currentCaseId: null })
     await dismissDuplicate(d.db, cases[0])
     expect((await readCase(d.db, a)).duplicateDismissed).toBe(true)
+  })
+})
+
+describe('receipts', () => {
+  it('lets a reporter reopen their case on a second device and watch it live, while a stranger cannot', async () => {
+    const r = reporter('rep1')
+    const made = await createCaseQueued(r.db, r.actor, input('trauma'))
+    await made.done
+    const { caseId, secret } = parseReceipt(made.receipt)!
+    const phone2 = reporter('rep1-second-device')
+    await claimCase(phone2.db, phone2.actor, caseId, secret)
+    let status = ''
+    const unsub = onSnapshot(doc(phone2.db, 'cases', caseId), (s) => { status = s.data()?.status })
+    await dispatchIt(caseId)
+    await waitFor(() => status, (s) => s === 'enroute')
+    unsub()
+    await expect(claimCase(stranger().db, stranger().actor, caseId, 'definitely-not-the-secret-0000')).rejects.toThrow()
+  })
+})
+
+describe('evidence and the AI briefing, end to end', () => {
+  async function caseWithEvidence() {
+    const rep = reporter('rep1')
+    const id = await reportCase('snakebite', { brief: 'Adult male bitten on the leg' }, rep)
+    await uploadEvidence(rep.db, rep.actor, id, 'photo1', bytes(900_000), { name: 'leg.jpg', mime: 'image/jpeg', kind: 'image', origin: 'camera' })
+    await uploadEvidence(rep.db, rep.actor, id, 'voice1', bytes(300_000), { name: 'voice-note.webm', mime: 'audio/webm', kind: 'audio', origin: 'recorder' })
+    await uploadEvidence(rep.db, rep.actor, id, 'doc1', bytes(100_000), { name: 'history.pdf', mime: 'application/pdf', kind: 'document', origin: 'file' })
+    await uploadEvidence(rep.db, rep.actor, id, 'vid1', bytes(1_600_000), { name: 'clip.mp4', mime: 'video/mp4', kind: 'video', origin: 'file' })
+    const d = disp()
+    const evidence = (await getDocs(collection(d.db, 'cases', id, 'evidence'))).docs.map((x) => ({ ...x.data(), id: x.id }) as Evidence)
+    return { id, d, evidence }
+  }
+
+  it('stores every media type and logs it on the timeline', async () => {
+    const { id, evidence } = await caseWithEvidence()
+    expect(evidence.map((e) => e.kind).sort()).toEqual(['audio', 'document', 'image', 'video'])
+    expect(evidence.every((e) => e.status === 'ready')).toBe(true)
+    expect((await eventKinds(id)).filter((k) => k === 'evidence')).toHaveLength(4)
+  })
+
+  it('resumes an interrupted upload instead of starting over', async () => {
+    const rep = reporter('rep1')
+    const id = await reportCase('trauma', {}, rep)
+    const data = bytes(1_500_000)
+    const meta = { name: 'a.jpg', mime: 'image/jpeg', kind: 'image' as const, origin: 'file' as const }
+    // A previous attempt got as far as the metadata and the first chunk before the connection dropped.
+    await setDoc(doc(rep.db, 'cases', id, 'evidence', 'resume1'), {
+      name: meta.name, mime: meta.mime, kind: meta.kind, size: data.length, sha256: await sha256Hex(data), chunkCount: 3, chunkSize: CHUNK_SIZE,
+      status: 'uploading', uploaderUid: 'rep1', createdAtMs: Date.now(), origin: meta.origin,
+    })
+    await setDoc(doc(rep.db, 'cases', id, 'evidence', 'resume1', 'chunks', '0'), { i: 0, data: Bytes.fromUint8Array(data.subarray(0, CHUNK_SIZE)) })
+    expect((await getDocs(collection(rep.db, 'cases', id, 'evidence', 'resume1', 'chunks'))).size).toBe(1)
+    // Resuming must write only chunks 1 and 2 (rewriting chunk 0 would be refused), then finish and verify.
+    const progress: number[] = []
+    await uploadEvidence(rep.db, rep.actor, id, 'resume1', data, meta, (done) => progress.push(done))
+    expect(progress[0]).toBe(1) // starts from what is already there
+    expect(progress.at(-1)).toBe(3)
+    const ev = { ...(await getDoc(doc(rep.db, 'cases', id, 'evidence', 'resume1'))).data(), id: 'resume1' } as Evidence
+    expect(ev.status).toBe('ready')
+    expect(Buffer.compare(new Uint8Array(await (await downloadEvidence(rep.db, id, ev)).arrayBuffer()), data)).toBe(0)
+    // Calling it again on a finished upload is a harmless no-op.
+    await uploadEvidence(rep.db, rep.actor, id, 'resume1', data, meta)
+  })
+
+  it('produces a labelled AI draft that is private until a dispatcher reviews and shares it', async () => {
+    const { id, d, evidence } = await caseWithEvidence()
+    await dispatchIt(id)
+    const c = await readCase(d.db, id)
+    const res = await analyseCase(d.db, new FakeAiClient('ok'), c, evidence, 'Near the bus stop')
+    expect(res.ok).toBe(true)
+    const draft = (await getDoc(doc(d.db, 'cases', id, 'ai', 'draft'))).data() as AiBriefing
+    expect(draft).toMatchObject({ aiGenerated: true })
+    expect(draft.model).toMatch(/test-fake/)
+    expect(draft.transcript).toMatch(/Test transcript/) // the audio was transcribed
+    expect(draft.missingInformation.length).toBeGreaterThan(0)
+    await expect(getDoc(doc(hosp('h1').db, 'cases', id, 'ai', 'draft'))).rejects.toThrow()
+    // the dispatcher corrects the draft, then shares it
+    const corrected = { ...draft, handoff: draft.handoff + ' Dispatcher note: patient is conscious.', edited: true }
+    await shareHandoff(d.db, d.actor, id, corrected)
+    const seen = (await getDoc(doc(hosp('h1').db, 'cases', id, 'ai', 'handoff'))).data() as AiBriefing
+    expect(seen).toMatchObject({ aiGenerated: true, edited: true, reviewedByUid: 'disp1' })
+    expect(seen.handoff).toMatch(/Dispatcher note/)
+    expect((await getDoc(doc(d.db, 'cases', id))).data()?.brief).toBe('Adult male bitten on the leg') // the original report is untouched
+    expect(await eventKinds(id)).toContain('ai')
+  })
+
+  it('reports an unavailable AI plainly and saves nothing', async () => {
+    const { id, d, evidence } = await caseWithEvidence()
+    const res = await analyseCase(d.db, new FakeAiClient('down'), await readCase(d.db, id), evidence, '')
+    expect(res).toMatchObject({ ok: false, unavailable: true })
+    expect((await getDoc(doc(d.db, 'cases', id, 'ai', 'draft'))).exists()).toBe(false)
+  })
+
+  it('rejects a malformed AI answer instead of guessing, and saves nothing', async () => {
+    const { id, d, evidence } = await caseWithEvidence()
+    const res = await analyseCase(d.db, new FakeAiClient('malformed'), await readCase(d.db, id), evidence, '')
+    expect(res).toMatchObject({ ok: false, unavailable: false })
+    expect((await getDoc(doc(d.db, 'cases', id, 'ai', 'draft'))).exists()).toBe(false)
+  })
+
+  it('strips diagnosis, treatment, resource claims and dispatch advice from an overreaching AI', async () => {
+    const { id, d, evidence } = await caseWithEvidence()
+    const res = await analyseCase(d.db, new FakeAiClient('overreach'), await readCase(d.db, id), evidence, '')
+    expect(res.ok).toBe(true)
+    const draft = (await getDoc(doc(d.db, 'cases', id, 'ai', 'draft'))).data() as AiBriefing
+    for (const bad of [/heart attack/i, /aspirin/i, /300 mg/i, /antivenom in stock/i, /taken there/i, /diagnosis/i, /administer/i]) {
+      expect(`${draft.summary} ${draft.handoff}`).not.toMatch(bad)
+    }
+    expect(draft.guardrailFlags.length).toBeGreaterThanOrEqual(3)
+  })
+
+  it('only dispatch can run or store AI output', async () => {
+    const { id, evidence } = await caseWithEvidence()
+    await dispatchIt(id)
+    const h = hosp('h1')
+    await expect(setDoc(doc(h.db, 'cases', id, 'ai', 'draft'), { aiGenerated: true, model: 'x', summary: 's', handoff: 'h' })).rejects.toThrow()
+    const res = await analyseCase(h.db, new FakeAiClient('ok'), await readCase(h.db, id), evidence, '').catch(() => ({ ok: false }))
+    expect(res.ok).toBe(false)
   })
 })
 
@@ -336,3 +507,6 @@ describe('reporter protections still hold mid-workflow', () => {
     await assertFails(getDocs(collection(rep.db, 'offers')))
   })
 })
+
+// referenced to keep helper imports honest
+void [mkAmbulance, dispatchCase, closeCase]

@@ -111,7 +111,8 @@ interface PlanInput {
  */
 export function planEscalation({ c, offers, hospitals, nowMs, etaFor }: PlanInput): PlanAction[] {
   const actions: PlanAction[] = []
-  if (c.status === 'reported' || c.status === 'closed' || c.status === 'arrived') return actions
+  // Hospitals are asked only after a crew has ACCEPTED the dispatch, and the engine stops once the patient has arrived.
+  if (!['enroute', 'onscene', 'transporting'].includes(c.status)) return actions
 
   const expired = offers.filter((o) => o.state === 'pending' && o.expiresAtMs <= nowMs)
   if (expired.length) actions.push({ type: 'timeout', offerIds: expired.map((o) => o.id) })

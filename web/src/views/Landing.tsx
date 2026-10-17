@@ -1,58 +1,118 @@
-import { useState } from 'react'
-import { ErrorBox } from '../components/bits'
+import { useRef, useState } from 'react'
+import { ErrorBox, Icon, InstallHint, Notice, Panel, RelayTrack } from '../components/ui'
 import { friendlyAuthError, useAuth } from '../lib/auth'
+import { parseReceipt } from '../lib/crypto'
 
-export default function Landing({ onReport }: { onReport: () => void }) {
-  const { signInStaff } = useAuth()
-  const [staff, setStaff] = useState(false)
+function SignIn() {
+  const { signInStaff, sendReset } = useAuth()
   const [email, setEmail] = useState('')
   const [password, setPassword] = useState('')
+  const [show, setShow] = useState(false)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [forgot, setForgot] = useState(false)
+  const [resetNote, setResetNote] = useState<string | null>(null)
 
   async function submit(e: React.FormEvent) {
     e.preventDefault()
     setBusy(true)
     setError(null)
-    try { await signInStaff(email, password) } catch (err) { setError(friendlyAuthError(err)) } finally { setBusy(false) }
+    try { await signInStaff(email, password) } catch (err) { setError(friendlyAuthError(err)); setBusy(false) }
+  }
+
+  async function reset(e: React.FormEvent) {
+    e.preventDefault()
+    setBusy(true)
+    setError(null)
+    try {
+      await sendReset(email)
+      setResetNote('If that address has an account, a reset link is on its way. Accounts issued for this demonstration use addresses that cannot receive email, so ask your administrator to reset the password instead.')
+    } catch (err) { setError(friendlyAuthError(err)) } finally { setBusy(false) }
   }
 
   return (
-    <div className="landing">
-      <section className="hero">
-        <p className="eyebrow">Emergency coordination · demo</p>
-        <h1>The first hour decides.<br />Get the right hospital ready <em>before</em> the ambulance arrives.</h1>
-        <p className="lede">GoldenHour asks the five nearest capable hospitals to confirm resources while the crew is still driving to the scene, then lets a dispatcher confirm the destination.</p>
-        <div className="row">
-          <button className="btn primary big" onClick={onReport}>🚨 Report an emergency</button>
-          <button className="btn big" onClick={() => setStaff((s) => !s)} aria-expanded={staff}>Staff sign in</button>
-        </div>
-        <p className="sub" style={{ marginTop: 12 }}>In a real emergency in India, call <b>112</b>. This is a demonstration system and is not for real dispatch.</p>
-      </section>
-
-      {staff && (
-        <form className="card stack signin" onSubmit={submit} aria-label="Staff sign in">
-          <div>
-            <h2 className="h">Staff sign in</h2>
-            <p className="sub">Dispatchers, hospital teams and ambulance crews. Accounts are issued by an administrator; there is no self-registration.</p>
+    <Panel title={forgot ? 'Reset your password' : 'Staff sign in'}>
+      <p className="sub measure">Dispatchers, ambulance crews and hospital teams. Accounts are issued by an administrator, so there is no sign-up.</p>
+      {error && <ErrorBox>{error}</ErrorBox>}
+      {resetNote && <Notice tone="go" title="Check your inbox">{resetNote}</Notice>}
+      {!forgot ? (
+        <form className="stack" onSubmit={submit} aria-label="Staff sign in">
+          <label className="field"><span className="field-label">Email</span>
+            <input id="signin-email" type="email" name="email" autoComplete="username" inputMode="email" required value={email} onChange={(e) => setEmail(e.target.value)} aria-invalid={!!error} />
+          </label>
+          <div className="field">
+            <label className="field-label" htmlFor="signin-password">Password</label>
+            <div className="row" style={{ flexWrap: 'nowrap' }}>
+              <input id="signin-password" type={show ? 'text' : 'password'} name="password" autoComplete="current-password" required value={password} onChange={(e) => setPassword(e.target.value)} aria-invalid={!!error} />
+              <button type="button" className="btn btn-sm" onClick={() => setShow((s) => !s)} aria-pressed={show} aria-label={show ? 'Hide password' : 'Show password'}>{show ? 'Hide' : 'Show'}</button>
+            </div>
           </div>
-          {error && <ErrorBox>{error}</ErrorBox>}
-          <label>Email<input type="email" autoComplete="username" required value={email} onChange={(e) => setEmail(e.target.value)} /></label>
-          <label>Password<input type="password" autoComplete="current-password" required value={password} onChange={(e) => setPassword(e.target.value)} /></label>
-          <button className="btn primary" disabled={busy}>{busy ? 'Signing in…' : 'Sign in'}</button>
+          <button className="btn btn-ink btn-lg" disabled={busy}>{busy ? <><span className="spin" /> Signing in</> : 'Sign in'}</button>
+          <button type="button" className="btn btn-quiet" onClick={() => { setForgot(true); setError(null) }}>Forgot your password?</button>
+        </form>
+      ) : (
+        <form className="stack" onSubmit={reset} aria-label="Reset password">
+          <label className="field"><span className="field-label">Account email</span><input type="email" required value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="username" /></label>
+          <button className="btn btn-ink" disabled={busy || !!resetNote}>{busy ? <><span className="spin" /> Sending</> : 'Email me a reset link'}</button>
+          <button type="button" className="btn btn-quiet" onClick={() => { setForgot(false); setResetNote(null); setError(null) }}>Back to sign in</button>
         </form>
       )}
+    </Panel>
+  )
+}
 
-      <section className="features" aria-label="How it works">
-        {[
-          ['📨', 'Parallel requests', 'Five nearest eligible hospitals are asked at the moment of dispatch.'],
-          ['✅', 'Explicit confirmation', 'Hospitals confirm the live resources for this case, never a static profile.'],
-          ['🧭', 'Explainable choice', 'Dispatch sees why a hospital is recommended and can override with a reason.'],
-          ['🔔', 'Automatic escalation', 'Declines and silence trigger the next wave, or a clear human escalation.'],
-        ].map(([icon, title, text]) => (
-          <div key={title} className="card feature"><div className="feature-icon" aria-hidden>{icon}</div><b>{title}</b><p className="sub">{text}</p></div>
-        ))}
+function ReopenReport({ onOpen }: { onOpen: (code: string) => void }) {
+  const [code, setCode] = useState('')
+  const [error, setError] = useState<string | null>(null)
+  return (
+    <Panel title="Reopen a report" quiet>
+      <p className="sub measure">Lost the page or switching device? Paste the receipt code or link you were given when you sent the report. The code proves the report is yours; an ID alone opens nothing.</p>
+      <form className="stack" onSubmit={(e) => { e.preventDefault(); if (!parseReceipt(code)) setError('That does not look like a receipt code. It is the long code shown after you sent the report.'); else { setError(null); onOpen(code) } }}>
+        <label className="field"><span className="field-label">Receipt code or link</span><input type="text" value={code} onChange={(e) => setCode(e.target.value)} autoComplete="off" spellCheck={false} aria-invalid={!!error} /></label>
+        {error && <p className="error-text" role="alert">{error}</p>}
+        <button className="btn" disabled={!code.trim()}>Open my report</button>
+      </form>
+    </Panel>
+  )
+}
+
+export default function Landing({ onReport, onOpenReceipt, hasOpenReports, onMine }: { onReport: () => void; onOpenReceipt: (code: string) => void; hasOpenReports: boolean; onMine: () => void }) {
+  const signInRef = useRef<HTMLDivElement>(null)
+  return (
+    <div className="stack-lg">
+      <div className="landing-hero">
+        <div className="stack-lg">
+          <div className="stack">
+            <h1 className="display">Get the right hospital ready before the ambulance arrives.</h1>
+            <p className="lede">Report an emergency in about a minute. Dispatch sends a crew. While the crew is still driving, the nearest hospitals that can treat this patient confirm their resources, and one is chosen.</p>
+          </div>
+          <div className="row">
+            <button className="btn btn-go btn-lg" onClick={onReport}><Icon name="alert" /> Report an emergency</button>
+            <button className="btn btn-lg" onClick={() => { signInRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }); document.getElementById('signin-email')?.focus() }}>Staff sign in</button>
+            {hasOpenReports && <button className="btn btn-lg btn-quiet" onClick={onMine}>Your reports</button>}
+          </div>
+          <p className="fine measure">In a real emergency in India, call 112. This is a demonstration system and is not used for real dispatch.</p>
+        </div>
+        <div ref={signInRef}><SignIn /></div>
+      </div>
+
+      <section className="stack" aria-labelledby="how">
+        <h2 className="title" id="how">Every case is a hand-off.</h2>
+        <p className="lede">Each screen shows who holds the case right now. Whoever must act sees &ldquo;Your move&rdquo;, and everyone else sees who they are waiting on.</p>
+        <RelayTrack c={null} viewer="reporter" demo={{ holder: 'dispatcher', notes: { reporter: 'You describe it', dispatcher: 'Sends a crew', crew: 'Accepts and drives', hospital: 'Confirms it can treat' } }} />
+        <div className="landing-steps">
+          {[
+            ['person', 'You', 'Say what happened, where, and add photos, a voice note or a document if you can.'],
+            ['radio', 'Dispatcher', 'Reads the report and its evidence, then chooses one ambulance and sends it the case.'],
+            ['ambulance', 'Crew', 'Accepts or declines. Once they accept, they head to the scene.'],
+            ['hospital', 'Hospital', 'Confirms, for this patient, that the right team and resources are ready. Nothing is assumed from a profile.'],
+          ].map(([icon, who, text]) => (
+            <div key={who} className="stack-sm"><Icon name={icon as 'person'} size={28} /><h3 className="h-sm">{who}</h3><p className="sub">{text}</p></div>
+          ))}
+        </div>
       </section>
+
+      <div className="cols-2"><ReopenReport onOpen={onOpenReceipt} /><InstallHint /></div>
     </div>
   )
 }

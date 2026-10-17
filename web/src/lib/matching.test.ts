@@ -163,8 +163,8 @@ describe('planEscalation', () => {
     const c = mkCase({ selectedHospitalId: 'h1', notifiedHospitalIds: ['h1'] })
     expect(planEscalation({ ...base, c, offers: [accepted('h1', { state: 'selected' })], nowMs: T0 })).toEqual([])
   })
-  it('ignores cases that are not yet dispatched or are finished', () => {
-    for (const status of ['reported', 'arrived', 'closed'] as const) {
+  it('ignores cases before the crew accepts and cases that are finished', () => {
+    for (const status of ['reported', 'dispatched', 'arrived', 'closed'] as const) {
       expect(planEscalation({ ...base, c: mkCase({ status }), offers: [], nowMs: T0 })).toEqual([])
     }
   })

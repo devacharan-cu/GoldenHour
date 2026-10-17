@@ -22,10 +22,10 @@ export const SEED_HOSPITALS = [
 void T
 
 export const SEED_AMBULANCES: Ambulance[] = [
-  { id: 'amb-1', callSign: 'Medic 1', base: 'Hampankatta', lat: 12.8695, lng: 74.842, available: true },
-  { id: 'amb-2', callSign: 'Medic 2', base: 'Kankanady', lat: 12.875, lng: 74.86, available: true },
-  { id: 'amb-3', callSign: 'Medic 3', base: 'Deralakatte', lat: 12.815, lng: 74.86, available: true },
-  { id: 'amb-4', callSign: 'Medic 4', base: 'Surathkal', lat: 12.99, lng: 74.795, available: true },
+  { id: 'amb-1', callSign: 'Medic 1', base: 'Hampankatta', lat: 12.8695, lng: 74.842, available: true, currentCaseId: null },
+  { id: 'amb-2', callSign: 'Medic 2', base: 'Kankanady', lat: 12.875, lng: 74.86, available: true, currentCaseId: null },
+  { id: 'amb-3', callSign: 'Medic 3', base: 'Deralakatte', lat: 12.815, lng: 74.86, available: true, currentCaseId: null },
+  { id: 'amb-4', callSign: 'Medic 4', base: 'Surathkal', lat: 12.99, lng: 74.795, available: true, currentCaseId: null },
 ]
 
 export interface SeedAccount { key: string; email: string; displayName: string; role: Role; hospitalId?: string; ambulanceId?: string }

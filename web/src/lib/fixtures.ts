@@ -12,19 +12,19 @@ export function mkHospital(id: string, lat: number, lng: number, caps: Capabilit
 }
 
 export function mkAmbulance(id: string, lat: number, lng: number, available = true): Ambulance {
-  return { id, callSign: id, base: 'Base', lat, lng, available }
+  return { id, callSign: id, base: 'Base', lat, lng, available, currentCaseId: available ? null : 'busy-case' }
 }
 
 export function mkCase(over: Partial<Case> = {}): Case {
   const type: CaseType = over.type ?? 'trauma'
   return {
     id: 'c1', type, severity: 1, patients: 1, needsIcu: false, brief: 'Adult, conscious', locationSource: 'manual', reporterUid: 'rep',
-    createdAtMs: T0, status: 'dispatched', requiredCapabilities: requiredCapabilities(type, over.needsIcu ?? false),
-    lat: 12.87, lng: 74.84, ambulanceId: 'amb-1', ambulanceCallSign: 'Medic 1', ambulanceAckAtMs: null, ambulancePos: null,
-    etaSceneMin: 5, etaSource: 'estimate', dispatchedAtMs: T0, notifiedHospitalIds: [], offerWave: 1, recommendedHospitalId: null,
-    selectedHospitalId: null, selectedHospitalName: null, selectedAtMs: null, selectedByUid: null, overrideReason: null,
+    createdAtMs: T0, status: 'enroute', requiredCapabilities: requiredCapabilities(type, over.needsIcu ?? false),
+    lat: 12.87, lng: 74.84, ambulanceId: 'amb-1', ambulanceCallSign: 'Medic 1', ambulanceAckAtMs: T0, crewOfferedAtMs: T0, declinedAmbulanceIds: [], crewDeclineReason: null, ambulancePos: null,
+    etaSceneMin: 5, etaSource: 'estimate', dispatchedAtMs: T0, notifiedHospitalIds: [], activeHospitalIds: [], hospitalAlertAtMs: null, offerWave: 1, recommendedHospitalId: null,
+    selectedHospitalId: null, selectedHospitalName: null, selectedAtMs: null, selectedByUid: null, overrideReason: null, destinationAckAtMs: null, destinationAckByUid: null, pickupAtMs: null,
     escalation: 'none', escalationNote: null, duplicateOf: null, duplicateDismissed: false, arrivalConfirmedAtMs: null,
-    arrivalConfirmedByUid: null, closedAtMs: null, closeReason: null, ...over,
+    arrivalConfirmedByUid: null, closedAtMs: null, closeReason: null, receiptHash: 'a'.repeat(64), evidenceExpected: 0, ...over,
   }
 }
 

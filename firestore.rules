@@ -3,10 +3,10 @@ rules_version = '2';
 // GoldenHour security rules. These ARE the trust boundary (there is no backend on the Spark plan).
 //
 // Roles live in users/{uid}, which no client can write. Accounts and role documents are created only by
-// scripts/provision.mjs running with project-owner credentials. Reporters need no role: any signed-in
+// web/scripts/provision.mjs running with project-owner credentials. Reporters need no role: any signed-in
 // user (including anonymous) may report an emergency and read only their own case.
 //
-// DEMONSTRATION SYSTEM: rules reduce risk but have limits (see README "Security model and limitations").
+// DEMONSTRATION SYSTEM: rules reduce risk but have limits (see SECURITY.md).
 
 service cloud.firestore {
   match /databases/{database}/documents {
@@ -21,8 +21,10 @@ service cloud.firestore {
     function isHospital() { return hasActiveProfile() && prof().role == 'hospital'; }
     function isAmbulance() { return hasActiveProfile() && prof().role == 'ambulance'; }
     function isStaff() { return isDispatcher() || isHospital() || isAmbulance(); }
-    function actorRole() { return isDispatcher() ? 'dispatcher' : isHospital() ? 'hospital' : isAmbulance() ? 'ambulance' : 'reporter'; }
     function casePath(caseId) { return /databases/$(database)/documents/cases/$(caseId); }
+    function caseData(caseId) { return get(casePath(caseId)).data; }
+    function claimPath(caseId) { return /databases/$(database)/documents/cases/$(caseId)/claims/$(request.auth.uid); }
+    function isClaimant(caseId) { return signedIn() && exists(claimPath(caseId)); }
     function nowMs() { return request.time.toMillis(); }
     function near(ms) { return ms is number && ms > nowMs() - 300000 && ms < nowMs() + 300000; }
     function validPos(p) {
@@ -47,6 +49,18 @@ service cloud.firestore {
       allow write: if false;
     }
 
+    // ---------- display preferences (theme, text size, alerts), private to each signed-in person ----------
+    match /userPrefs/{userId} {
+      allow read: if signedIn() && userId == uid();
+      allow create, update: if signedIn() && userId == uid()
+        && request.resource.data.keys().hasOnly(['theme','textSize','reduceMotion','sound','desktopAlerts','compact'])
+        && request.resource.data.theme in ['system','light','dark']
+        && request.resource.data.textSize in ['normal','large','xlarge']
+        && request.resource.data.reduceMotion in ['system','on']
+        && request.resource.data.sound is bool && request.resource.data.desktopAlerts is bool && request.resource.data.compact is bool;
+      allow delete: if false;
+    }
+
     // ---------- hospitals ----------
     match /hospitals/{hospitalId} {
       allow read: if isStaff();
@@ -69,30 +83,48 @@ service cloud.firestore {
     }
 
     // ---------- ambulances ----------
+    // A unit holds at most one case: currentCaseId may only be set while it is null, and only for a case that really
+    // names this unit and is awaiting its answer. It is released when that case no longer names the unit or is closed.
     match /ambulances/{ambulanceId} {
       allow read: if isStaff();
       allow create, delete: if false;
-      allow update: if (isDispatcher() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['available']))
+      allow update:
+        if (isDispatcher()
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['available','currentCaseId'])
+            && request.resource.data.available == (request.resource.data.currentCaseId == null)
+            && (
+              (resource.data.currentCaseId == null && request.resource.data.currentCaseId is string
+                && getAfter(casePath(request.resource.data.currentCaseId)).data.ambulanceId == ambulanceId
+                && getAfter(casePath(request.resource.data.currentCaseId)).data.status == 'dispatched')
+              || (resource.data.currentCaseId is string && request.resource.data.currentCaseId == null
+                && (getAfter(casePath(resource.data.currentCaseId)).data.ambulanceId != ambulanceId
+                    || getAfter(casePath(resource.data.currentCaseId)).data.status == 'closed'))))
+        // the crew can report its own position, and free itself when it declines an offer
         || (isAmbulance() && prof().ambulanceId == ambulanceId
             && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lat','lng'])
-            && request.resource.data.lat is number && request.resource.data.lng is number);
+            && request.resource.data.lat is number && request.resource.data.lng is number)
+        || (isAmbulance() && prof().ambulanceId == ambulanceId
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['available','currentCaseId'])
+            && resource.data.currentCaseId is string && request.resource.data.currentCaseId == null && request.resource.data.available == true
+            && getAfter(casePath(resource.data.currentCaseId)).data.ambulanceId == null);
     }
 
     // ---------- cases ----------
-    function canReadCase(d) {
+    function canReadCase(d, caseId) {
       return isDispatcher()
-        || (signedIn() && d.reporterUid == uid())
+        || (signedIn() && (d.reporterUid == uid() || isClaimant(caseId)))
         || (isAmbulance() && d.ambulanceId == prof().ambulanceId)
-        || (isHospital() && d.notifiedHospitalIds.hasAny([prof().hospitalId]));
+        || (isHospital() && d.activeHospitalIds.hasAny([prof().hospitalId]));
     }
     function baseCapFor(t) {
       return {'cardiac':'cardiac','stroke':'stroke','trauma':'trauma','snakebite':'antivenom','burns':'burns','obstetric':'obstetric','paediatric':'paediatrics','other':'emergency'}[t];
     }
     function freshCase(d) {
       return d.keys().hasOnly(['type','severity','patients','needsIcu','brief','locationSource','reporterUid','createdAtMs','status','requiredCapabilities',
-          'lat','lng','ambulanceId','ambulanceCallSign','ambulanceAckAtMs','ambulancePos','etaSceneMin','etaSource','dispatchedAtMs','notifiedHospitalIds','offerWave',
-          'recommendedHospitalId','selectedHospitalId','selectedHospitalName','selectedAtMs','selectedByUid','overrideReason','escalation','escalationNote',
-          'duplicateOf','duplicateDismissed','arrivalConfirmedAtMs','arrivalConfirmedByUid','closedAtMs','closeReason'])
+          'lat','lng','ambulanceId','ambulanceCallSign','ambulanceAckAtMs','crewOfferedAtMs','declinedAmbulanceIds','crewDeclineReason','ambulancePos','etaSceneMin','etaSource',
+          'dispatchedAtMs','notifiedHospitalIds','activeHospitalIds','hospitalAlertAtMs','offerWave','recommendedHospitalId','selectedHospitalId','selectedHospitalName',
+          'selectedAtMs','selectedByUid','overrideReason','destinationAckAtMs','destinationAckByUid','pickupAtMs','escalation','escalationNote',
+          'duplicateOf','duplicateDismissed','arrivalConfirmedAtMs','arrivalConfirmedByUid','closedAtMs','closeReason','receiptHash','evidenceExpected'])
         && d.reporterUid == uid() && d.status == 'reported' && near(d.createdAtMs)
         && d.type in ['cardiac','stroke','trauma','snakebite','burns','obstetric','paediatric','other']
         && d.severity in [1,2,3] && d.patients is int && d.patients >= 1 && d.patients <= 50
@@ -100,66 +132,114 @@ service cloud.firestore {
         && d.lat is number && d.lat >= -90 && d.lat <= 90 && d.lng is number && d.lng >= -180 && d.lng <= 180
         && capList(d.requiredCapabilities) && d.requiredCapabilities.size() >= 1 && d.requiredCapabilities.size() <= 2
         && d.requiredCapabilities[0] == baseCapFor(d.type)
-        && d.ambulanceId == null && d.ambulanceCallSign == null && d.ambulanceAckAtMs == null && d.ambulancePos == null
-        && d.etaSceneMin == null && d.etaSource == null && d.dispatchedAtMs == null && d.notifiedHospitalIds == [] && d.offerWave == 0
+        && d.receiptHash is string && d.receiptHash.size() == 64 && d.receiptHash.matches('[0-9a-f]{64}')
+        && d.evidenceExpected is int && d.evidenceExpected >= 0 && d.evidenceExpected <= 10
+        && d.ambulanceId == null && d.ambulanceCallSign == null && d.ambulanceAckAtMs == null && d.crewOfferedAtMs == null
+        && d.declinedAmbulanceIds == [] && d.crewDeclineReason == null && d.ambulancePos == null
+        && d.etaSceneMin == null && d.etaSource == null && d.dispatchedAtMs == null && d.notifiedHospitalIds == [] && d.activeHospitalIds == []
+        && d.hospitalAlertAtMs == null && d.offerWave == 0
         && d.recommendedHospitalId == null && d.selectedHospitalId == null && d.selectedHospitalName == null && d.selectedAtMs == null
-        && d.selectedByUid == null && d.overrideReason == null && d.escalation == 'none' && d.escalationNote == null
+        && d.selectedByUid == null && d.overrideReason == null && d.destinationAckAtMs == null && d.destinationAckByUid == null && d.pickupAtMs == null
+        && d.escalation == 'none' && d.escalationNote == null
         && d.duplicateOf == null && d.duplicateDismissed == false && d.arrivalConfirmedAtMs == null && d.arrivalConfirmedByUid == null
         && d.closedAtMs == null && d.closeReason == null;
     }
+
     function dispatcherCaseUpdate(caseId) {
       let a = request.resource.data;
       let b = resource.data;
+      let released = a.ambulanceId == null && a.ambulanceCallSign == null && a.ambulancePos == null && a.dispatchedAtMs == null
+        && a.crewOfferedAtMs == null && a.ambulanceAckAtMs == null && a.etaSceneMin == null && a.etaSource == null;
       return a.reporterUid == b.reporterUid && a.createdAtMs == b.createdAtMs && a.type == b.type && a.severity == b.severity
         && a.lat == b.lat && a.lng == b.lng && a.requiredCapabilities == b.requiredCapabilities && a.brief == b.brief
-        && a.patients == b.patients && a.needsIcu == b.needsIcu
-        // the dispatcher may only move reported -> dispatched, or close; ambulance/hospital own the other transitions
-        && (a.status == b.status || (b.status == 'reported' && a.status == 'dispatched') || a.status == 'closed')
+        && a.patients == b.patients && a.needsIcu == b.needsIcu && a.receiptHash == b.receiptHash && a.evidenceExpected == b.evidenceExpected
+        // crew-owned and hospital-owned facts are never rewritten by dispatch
+        && a.declinedAmbulanceIds == b.declinedAmbulanceIds && a.crewDeclineReason == b.crewDeclineReason
+        && a.pickupAtMs == b.pickupAtMs && a.arrivalConfirmedAtMs == b.arrivalConfirmedAtMs && a.arrivalConfirmedByUid == b.arrivalConfirmedByUid
+        && a.notifiedHospitalIds.hasAll(b.notifiedHospitalIds) && a.activeHospitalIds.hasOnly(a.notifiedHospitalIds)
+        // status moves: offer a reported case; take an unanswered offer back; or close (a patient who arrived needs the hospital's confirmation first)
+        && (a.status == b.status
+            || (b.status == 'reported' && a.status == 'dispatched' && a.ambulanceId is string && near(a.crewOfferedAtMs) && a.ambulanceAckAtMs == null
+                && !b.declinedAmbulanceIds.hasAny([a.ambulanceId]))
+            || (b.status == 'dispatched' && a.status == 'reported' && released)
+            || (a.status == 'closed' && a.closeReason is string && a.closeReason.size() >= 3 && near(a.closedAtMs)
+                && (b.status != 'arrived' || b.arrivalConfirmedAtMs != null)))
+        && (a.status != 'dispatched' || b.status == 'dispatched' || b.status == 'reported')
+        // the unit named on a live case cannot be swapped silently
+        && (a.ambulanceId == b.ambulanceId || (b.status == 'reported' && a.status == 'dispatched') || (b.status == 'dispatched' && a.status == 'reported') || a.status == 'closed' && a.ambulanceId == b.ambulanceId)
+        && (a.ambulanceAckAtMs == b.ambulanceAckAtMs || a.ambulanceAckAtMs == null)
         && validPos(a.ambulancePos)
         && a.escalation in ['none','attention','no_hospital']
         && (a.recommendedHospitalId == b.recommendedHospitalId || a.recommendedHospitalId == null
             || qualified(get(offerPath(caseId, a.recommendedHospitalId)).data, a.requiredCapabilities))
-        // destination can only be a hospital that explicitly confirmed, and a non-recommended pick needs a written reason
+        // destination can only be a hospital that explicitly confirmed, a non-recommended pick needs a written reason,
+        // and changing the destination clears the crew's acknowledgement
         && (a.selectedHospitalId == b.selectedHospitalId || a.selectedHospitalId == null
             || (a.selectedByUid == uid()
                 && qualified(get(offerPath(caseId, a.selectedHospitalId)).data, a.requiredCapabilities)
-                && (a.selectedHospitalId == a.recommendedHospitalId || (a.overrideReason is string && a.overrideReason.size() >= 3))));
+                && a.destinationAckAtMs == null
+                && (a.selectedHospitalId == a.recommendedHospitalId || (a.overrideReason is string && a.overrideReason.size() >= 3))))
+        && (a.destinationAckAtMs == b.destinationAckAtMs || a.destinationAckAtMs == null)
+        && (a.destinationAckByUid == b.destinationAckByUid || a.destinationAckByUid == null);
     }
-    function ambulanceCaseUpdate() {
+
+    function crewCaseUpdate() {
       let a = request.resource.data;
       let b = resource.data;
+      let aff = a.diff(b).affectedKeys();
+      let progress = ['ambulancePos','etaSceneMin','etaSource'];
       return isAmbulance() && b.ambulanceId == prof().ambulanceId
-        && a.diff(b).affectedKeys().hasOnly(['status','ambulancePos','etaSceneMin','etaSource','ambulanceAckAtMs'])
         && validPos(a.ambulancePos)
         && (a.etaSceneMin == null || (a.etaSceneMin is int && a.etaSceneMin >= 0 && a.etaSceneMin <= 600))
-        && (a.status == b.status
-            || (b.status == 'dispatched' && a.status == 'enroute' && near(a.ambulanceAckAtMs))
-            || (b.status == 'enroute' && a.status == 'onscene')
-            || (b.status == 'onscene' && a.status == 'transporting' && b.selectedHospitalId != null)
-            || (b.status == 'transporting' && a.status == 'arrived'));
+        && (
+          // accept the dispatch offer
+          (b.status == 'dispatched' && a.status == 'enroute' && aff.hasOnly(['status','ambulanceAckAtMs'].concat(progress)) && near(a.ambulanceAckAtMs))
+          // decline it: the case goes back to dispatch with this unit recorded as having declined
+          || (b.status == 'dispatched' && a.status == 'reported' && a.ambulanceId == null && a.ambulanceCallSign == null && a.ambulancePos == null
+              && a.dispatchedAtMs == null && a.crewOfferedAtMs == null && a.etaSceneMin == null && a.etaSource == null
+              && a.declinedAmbulanceIds == b.declinedAmbulanceIds.concat([prof().ambulanceId])
+              && a.crewDeclineReason is string && a.crewDeclineReason.size() <= 120
+              && aff.hasOnly(['status','ambulanceId','ambulanceCallSign','ambulancePos','dispatchedAtMs','crewOfferedAtMs','etaSceneMin','etaSource','declinedAmbulanceIds','crewDeclineReason']))
+          // position and ETA updates
+          || (a.status == b.status && aff.hasOnly(progress))
+          // forward steps; transport needs a confirmed AND acknowledged destination
+          || (b.status == 'enroute' && a.status == 'onscene' && aff.hasOnly(['status'].concat(progress)))
+          || (b.status == 'onscene' && a.status == 'transporting' && b.selectedHospitalId != null && b.destinationAckAtMs != null
+              && near(a.pickupAtMs) && aff.hasOnly(['status','pickupAtMs'].concat(progress)))
+          || (b.status == 'transporting' && a.status == 'arrived' && aff.hasOnly(['status'].concat(progress)))
+          // acknowledge the confirmed destination
+          || (a.status == b.status && b.status in ['enroute','onscene'] && b.selectedHospitalId != null
+              && aff.hasOnly(['destinationAckAtMs','destinationAckByUid']) && near(a.destinationAckAtMs) && a.destinationAckByUid == uid()));
     }
-    function hospitalArrivalConfirm() {
+
+    function hospitalCaseUpdate(caseId) {
       let a = request.resource.data;
       let b = resource.data;
-      return isHospital() && b.selectedHospitalId == prof().hospitalId && b.status == 'arrived'
-        && a.diff(b).affectedKeys().hasOnly(['arrivalConfirmedAtMs','arrivalConfirmedByUid'])
-        && near(a.arrivalConfirmedAtMs) && a.arrivalConfirmedByUid == uid();
+      return isHospital()
+        // confirm the patient arrived
+        && ((b.selectedHospitalId == prof().hospitalId && b.status == 'arrived'
+              && a.diff(b).affectedKeys().hasOnly(['arrivalConfirmedAtMs','arrivalConfirmedByUid'])
+              && near(a.arrivalConfirmedAtMs) && a.arrivalConfirmedByUid == uid())
+          // drop out of the case, but only together with declining or withdrawing its own offer
+          || (b.activeHospitalIds.hasAny([prof().hospitalId]) && a.diff(b).affectedKeys().hasOnly(['activeHospitalIds'])
+              && a.activeHospitalIds == b.activeHospitalIds.removeAll([prof().hospitalId])
+              && getAfter(offerPath(caseId, prof().hospitalId)).data.state == 'declined'));
     }
 
     match /cases/{caseId} {
-      allow get, list: if canReadCase(resource.data);
+      allow get, list: if canReadCase(resource.data, caseId);
       allow create: if signedIn() && freshCase(request.resource.data);
-      allow update: if (isDispatcher() && dispatcherCaseUpdate(caseId)) || ambulanceCaseUpdate() || hospitalArrivalConfirm();
+      allow update: if (isDispatcher() && dispatcherCaseUpdate(caseId)) || crewCaseUpdate() || hospitalCaseUpdate(caseId);
       allow delete: if false;
 
-      // Contact details and free text. Visible to the reporter, dispatch, the assigned crew, and (after the
-      // dispatcher confirms the destination) the receiving hospital. Not to hospitals that were only asked.
+      // Contact details and free text. Visible to the reporter (or whoever holds the receipt), dispatch, the assigned
+      // crew, and (after the dispatcher confirms the destination) the receiving hospital.
       match /private/{docId} {
         allow read: if docId == 'patient' && (
           isDispatcher()
-          || (signedIn() && resource.data.reporterUid == uid())
-          || (isAmbulance() && get(casePath(caseId)).data.ambulanceId == prof().ambulanceId)
-          || (isHospital() && get(casePath(caseId)).data.selectedHospitalId == prof().hospitalId));
+          || (signedIn() && (resource.data.reporterUid == uid() || isClaimant(caseId)))
+          || (isAmbulance() && caseData(caseId).ambulanceId == prof().ambulanceId)
+          || (isHospital() && caseData(caseId).selectedHospitalId == prof().hospitalId));
         allow create: if docId == 'patient' && signedIn()
           && request.resource.data.keys().hasOnly(['contact','note','reporterUid'])
           && request.resource.data.reporterUid == uid()
@@ -169,9 +249,21 @@ service cloud.firestore {
         allow update, delete: if false;
       }
 
+      // A reporter on another device proves they hold the secret receipt code by presenting it. Only the SHA-256 of
+      // the secret is stored on the case; this document grants read access to that one signed-in session.
+      match /claims/{claimUid} {
+        allow read: if signedIn() && claimUid == uid();
+        allow create: if signedIn() && claimUid == uid()
+          && request.resource.data.keys().hasOnly(['secret','claimedAtMs'])
+          && request.resource.data.secret is string && request.resource.data.secret.size() >= 20 && request.resource.data.secret.size() <= 64
+          && near(request.resource.data.claimedAtMs)
+          && hashing.sha256(request.resource.data.secret).toHexString().lower() == caseData(caseId).receiptHash;
+        allow update, delete: if false;
+      }
+
       // Append-only audit trail. Nobody can edit or delete an event once written.
       match /events/{eventId} {
-        allow read: if isDispatcher() || (isAmbulance() && get(casePath(caseId)).data.ambulanceId == prof().ambulanceId);
+        allow read: if isDispatcher() || (isAmbulance() && caseData(caseId).ambulanceId == prof().ambulanceId);
         allow create: if signedIn()
           && request.resource.data.keys().hasOnly(['kind','text','atMs','actorUid','actorRole'])
           && request.resource.data.actorUid == uid()
@@ -180,12 +272,75 @@ service cloud.firestore {
           && request.resource.data.kind is string && request.resource.data.kind.size() <= 24
           && (
             (isDispatcher() && request.resource.data.actorRole in ['dispatcher','system'])
-            || (isAmbulance() && request.resource.data.actorRole == 'ambulance' && get(casePath(caseId)).data.ambulanceId == prof().ambulanceId)
-            || (isHospital() && request.resource.data.actorRole == 'hospital' && get(casePath(caseId)).data.notifiedHospitalIds.hasAny([prof().hospitalId]))
-            || (!isStaff() && request.resource.data.actorRole == 'reporter' && request.resource.data.kind == 'reported'
-                && getAfter(casePath(caseId)).data.reporterUid == uid()));
+            || (isAmbulance() && request.resource.data.actorRole == 'ambulance' && caseData(caseId).ambulanceId == prof().ambulanceId)
+            || (isHospital() && request.resource.data.actorRole == 'hospital' && caseData(caseId).notifiedHospitalIds.hasAny([prof().hospitalId]))
+            || (!isStaff() && request.resource.data.actorRole == 'reporter' && request.resource.data.kind in ['reported','evidence']
+                && (getAfter(casePath(caseId)).data.reporterUid == uid() || isClaimant(caseId))));
         allow update, delete: if false;
       }
+
+      // Evidence: files are stored as access-controlled binary chunks (Cloud Storage needs the paid Blaze plan).
+      // Anyone who may see the case may see its evidence, and hospitals lose access the moment they decline.
+      match /evidence/{evidenceId} {
+        allow read: if canReadEvidence(caseId);
+        allow create: if signedIn() && request.resource.data.uploaderUid == uid() && caseData(caseId).status != 'closed'
+          && (isDispatcher() || caseData(caseId).reporterUid == uid() || isClaimant(caseId))
+          && request.resource.data.keys().hasOnly(['name','mime','kind','size','sha256','chunkCount','chunkSize','status','uploaderUid','createdAtMs','origin'])
+          && request.resource.data.status == 'uploading' && near(request.resource.data.createdAtMs)
+          && request.resource.data.origin in ['camera','recorder','file']
+          && request.resource.data.name is string && request.resource.data.name.size() >= 1 && request.resource.data.name.size() <= 120
+          && request.resource.data.sha256 is string && request.resource.data.sha256.matches('[0-9a-f]{64}')
+          && request.resource.data.chunkSize == 716800
+          && request.resource.data.size is int && request.resource.data.size >= 1
+          && request.resource.data.chunkCount is int && request.resource.data.chunkCount >= 1 && request.resource.data.chunkCount <= 32
+          && request.resource.data.chunkCount == math.ceil(request.resource.data.size / 716800.0)
+          && ((request.resource.data.kind == 'image' && request.resource.data.mime in ['image/jpeg','image/png','image/webp'] && request.resource.data.size <= 5242880)
+            || (request.resource.data.kind == 'document' && request.resource.data.mime == 'application/pdf' && request.resource.data.size <= 8388608)
+            || (request.resource.data.kind == 'audio' && request.resource.data.mime in ['audio/webm','audio/ogg','audio/mpeg','audio/mp3','audio/mp4','audio/x-m4a','audio/m4a','audio/aac','audio/wav','audio/x-wav','audio/flac','audio/opus'] && request.resource.data.size <= 10485760)
+            || (request.resource.data.kind == 'video' && request.resource.data.mime in ['video/mp4','video/webm','video/quicktime','video/3gpp'] && request.resource.data.size <= 15728640));
+        // finish: only the uploader, only once the last chunk is present
+        allow update: if signedIn() && resource.data.uploaderUid == uid() && resource.data.status == 'uploading'
+          && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['status']) && request.resource.data.status == 'ready'
+          && exists(/databases/$(database)/documents/cases/$(caseId)/evidence/$(evidenceId)/chunks/$(string(resource.data.chunkCount - 1)));
+        // an unfinished upload can be abandoned; finished evidence is permanent
+        allow delete: if signedIn() && resource.data.uploaderUid == uid() && resource.data.status == 'uploading';
+
+        match /chunks/{chunkId} {
+          allow read: if canReadEvidence(caseId);
+          allow create: if signedIn() && chunkId.matches('[0-9]+')
+            && get(/databases/$(database)/documents/cases/$(caseId)/evidence/$(evidenceId)).data.uploaderUid == uid()
+            && get(/databases/$(database)/documents/cases/$(caseId)/evidence/$(evidenceId)).data.status == 'uploading'
+            && int(chunkId) < get(/databases/$(database)/documents/cases/$(caseId)/evidence/$(evidenceId)).data.chunkCount
+            && request.resource.data.keys().hasOnly(['i','data'])
+            && request.resource.data.i == int(chunkId)
+            && request.resource.data.data is bytes && request.resource.data.data.size() >= 1 && request.resource.data.data.size() <= 716800
+            && (int(chunkId) == get(/databases/$(database)/documents/cases/$(caseId)/evidence/$(evidenceId)).data.chunkCount - 1 || request.resource.data.data.size() == 716800);
+          allow update: if false;
+          allow delete: if signedIn() && get(/databases/$(database)/documents/cases/$(caseId)/evidence/$(evidenceId)).data.uploaderUid == uid()
+            && get(/databases/$(database)/documents/cases/$(caseId)/evidence/$(evidenceId)).data.status == 'uploading';
+        }
+      }
+
+      // AI-generated briefing. The draft is for dispatch only; the reviewed handoff is what crew and hospitals see.
+      match /ai/{docId} {
+        allow read: if (docId == 'draft' && isDispatcher())
+          || (docId == 'handoff' && (isDispatcher()
+              || (isAmbulance() && caseData(caseId).ambulanceId == prof().ambulanceId)
+              || (isHospital() && caseData(caseId).activeHospitalIds.hasAny([prof().hospitalId]))));
+        allow create, update: if isDispatcher() && docId in ['draft','handoff']
+          && request.resource.data.aiGenerated == true
+          && request.resource.data.model is string && request.resource.data.summary is string && request.resource.data.summary.size() <= 2000
+          && request.resource.data.handoff is string && request.resource.data.handoff.size() <= 1200
+          && (docId == 'draft' || (request.resource.data.reviewedByUid == uid() && near(request.resource.data.reviewedAtMs)));
+        allow delete: if false;
+      }
+    }
+
+    function canReadEvidence(caseId) {
+      return isDispatcher()
+        || (signedIn() && (caseData(caseId).reporterUid == uid() || isClaimant(caseId)))
+        || (isAmbulance() && caseData(caseId).ambulanceId == prof().ambulanceId)
+        || (isHospital() && caseData(caseId).activeHospitalIds.hasAny([prof().hospitalId]));
     }
 
     // ---------- offers: one request per hospital per case, id = caseId_hospitalId ----------
@@ -200,7 +355,7 @@ service cloud.firestore {
         && request.resource.data.respondedByUid == null && request.resource.data.confirmations == null && request.resource.data.canReceive == null
         && request.resource.data.declineReason == null && near(request.resource.data.requestedAtMs)
         && request.resource.data.expiresAtMs > request.resource.data.requestedAtMs && request.resource.data.expiresAtMs <= request.resource.data.requestedAtMs + 600000
-        && getAfter(casePath(request.resource.data.caseId)).data.notifiedHospitalIds.hasAny([request.resource.data.hospitalId]);
+        && getAfter(casePath(request.resource.data.caseId)).data.activeHospitalIds.hasAny([request.resource.data.hospitalId]);
 
       allow update:
         // dispatcher: time out only after the deadline, withdraw, select, or extend the deadline
