@@ -7,18 +7,15 @@ import { clearIndexedDbPersistence, connectFirestoreEmulator, initializeFirestor
 export const USE_EMULATORS = import.meta.env.VITE_USE_EMULATORS === '1'
 
 // Public web-client identifiers, not secrets. Access control is enforced by firestore.rules.
-const app = initializeApp(
-  USE_EMULATORS
-    ? { apiKey: 'demo-key', authDomain: 'localhost', projectId: 'demo-goldenhour', appId: 'demo-app' }
-    : {
-        apiKey: 'AIzaSyDU_4LEHP7R120mxs79fHrii1XL_UhAy3Y',
-        authDomain: 'goldenhour-46131.firebaseapp.com',
-        projectId: 'goldenhour-46131',
-        storageBucket: 'goldenhour-46131.firebasestorage.app',
-        messagingSenderId: '647769322176',
-        appId: '1:647769322176:web:b2bd320a054e45041fb325',
-      },
-)
+export const PROD_CONFIG = {
+  apiKey: 'AIzaSyDU_4LEHP7R120mxs79fHrii1XL_UhAy3Y',
+  authDomain: 'goldenhour-46131.firebaseapp.com',
+  projectId: 'goldenhour-46131',
+  storageBucket: 'goldenhour-46131.firebasestorage.app',
+  messagingSenderId: '647769322176',
+  appId: '1:647769322176:web:b2bd320a054e45041fb325',
+}
+const app = initializeApp(USE_EMULATORS ? { apiKey: 'demo-key', authDomain: 'localhost', projectId: 'demo-goldenhour', appId: 'demo-app' } : PROD_CONFIG)
 
 // App Check proves requests come from this genuine app (reCAPTCHA Enterprise, registered for goldenhour-46131.web.app).
 // It is what lets the AI endpoint refuse scripts and other sites. The site key is public by design; the secret never leaves Google.

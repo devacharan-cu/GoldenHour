@@ -1,4 +1,5 @@
-import { app, USE_EMULATORS } from './firebase'
+import { initializeApp } from 'firebase/app'
+import { app, PROD_CONFIG, USE_EMULATORS } from './firebase'
 import { FakeAiClient, createFirebaseAiClient, type AiClient } from './ai'
 
 let real: Promise<AiClient> | null = null
@@ -11,9 +12,14 @@ let real: Promise<AiClient> | null = null
  */
 export function getAiClient(): Promise<AiClient> {
   if (USE_EMULATORS) {
-    const mode = (window as unknown as { __GH_AI_MODE__?: 'ok' | 'down' | 'malformed' | 'overreach' }).__GH_AI_MODE__ ?? 'ok'
+    const mode = (window as unknown as { __GH_AI_MODE__?: 'ok' | 'down' | 'malformed' | 'overreach' | 'real' }).__GH_AI_MODE__ ?? 'ok'
+    // 'real' (emulator builds only): cases and people stay on the local emulators, but the briefing is produced by the real Gemini through
+    // the production project's Firebase AI Logic, from the real browser SDK. It lets the browser tests exercise the genuine AI path. Use synthetic data.
+    if (mode === 'real') return (realOnEmulators ??= createFirebaseAiClient(initializeApp(PROD_CONFIG, 'ai-only')))
     return Promise.resolve(new FakeAiClient(mode))
   }
   real ??= createFirebaseAiClient(app)
   return real
 }
+
+let realOnEmulators: Promise<AiClient> | null = null

@@ -598,6 +598,25 @@ try {
     await d2.close()
   })
 
+  await step('REAL GEMINI in a real browser: the briefing is written by gemini-3.5-flash from the report and its photo, labelled AI-generated, and stays a private draft', async () => {
+    // Cases and people stay on the local emulators; only the model call goes to the real Gemini through the production project\'s Firebase AI Logic.
+    const d3 = await open('dispatcher-real-ai', laptop)
+    await login(d3, 'dispatcher2@goldenhour.demo')
+    await d3.locator('.kpis').waitFor(T)
+    await d3.locator('button.strip', { hasText: 'OFFLINE TEST' }).first().click()
+    await d3.getByRole('list', { name: 'Attached evidence' }).waitFor({ timeout: 40000 })
+    await d3.evaluate(() => { window.__GH_AI_MODE__ = 'real' })
+    await d3.getByRole('button', { name: /Analyse report|Run the AI again/ }).click() // an earlier step may already have saved a (fake) draft on this case
+    await d3.getByText(/gemini-3\.5-flash/).first().waitFor({ timeout: 120000 })
+    const panel = await d3.getByLabel('AI draft').innerText()
+    assert.ok(!/test-fake-ai/.test(await d3.locator('main').innerText()), 'must be the real model, not the test fake')
+    await d3.getByText('AI-generated').first().waitFor(T)
+    await d3.getByText('Draft: not yet shared').first().waitFor(T)
+    assert.ok(panel.length > 80, 'the draft should contain a real briefing')
+    await shot(d3, '27-real-gemini-draft')
+    await d3.close()
+  })
+
   await step('every role is usable on a phone in both themes: no overflow and touch-sized controls', async () => {
     for (const th of ['light', 'dark']) {
       const p = await open(`phone-${th}`, phone, { hasTouch: true, isMobile: true, colorScheme: th })
