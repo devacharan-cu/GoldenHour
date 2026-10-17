@@ -71,10 +71,11 @@ Those emulator passwords are public test values and work **only** against the lo
 
 ## Production setup (project owner)
 
-1. Firebase console → Authentication → *Get started* → enable **Email/Password** and **Anonymous** (free; do not upgrade to Identity Platform).
-2. `node web/scripts/provision.mjs --prod` creates the staff accounts and seeds the demo hospitals/fleet using your own
+1. Firebase console → Authentication → *Get started* → enable **Email/Password** and **Anonymous** (both are required: reporters sign in anonymously) (free; do not upgrade to Identity Platform).
+2. `node web/scripts/provision.mjs --prod` (Auth REST + Firestore REST, no key file) creates the staff accounts and seeds the demo hospitals/fleet using your own
    `gcloud` login. Passwords go to `.secrets/accounts.json` (git-ignored) and are never printed.
 3. `firebase deploy --only firestore:rules,hosting`
+4. `npm run verify:live --prefix web` signs in as the real production accounts (passwords read from `.secrets/`, never printed) and runs one clearly-labelled test case through the whole workflow plus negative permission checks. It adds a new closed case and never edits or deletes existing records.
 
 ## Tests (what they cover)
 

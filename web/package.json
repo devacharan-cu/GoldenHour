@@ -12,7 +12,8 @@
     "test:emu": "firebase emulators:exec --only firestore --project demo-goldenhour \"vitest run --config vitest.emu.config.ts\"",
     "test:e2e": "firebase emulators:exec --only auth,firestore --project demo-goldenhour \"node e2e/e2e.mjs\"",
     "check": "npm run lint && tsc -b && npm test && npm run test:emu && npm run build",
-    "check:all": "npm run check && npm run test:e2e"
+    "check:all": "npm run check && npm run test:e2e",
+    "verify:live": "vitest run --config vitest.live.config.ts"
   },
   "dependencies": {
     "firebase": "^13.0.0",
