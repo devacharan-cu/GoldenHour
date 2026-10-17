@@ -7,7 +7,6 @@
 import { execFileSync, spawn } from 'node:child_process'
 import { mkdirSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
-import assert from 'node:assert/strict'
 import { chromium, devices, webkit } from 'playwright-core'
 
 const PORT = 5198
@@ -32,7 +31,7 @@ const MATRIX = [
   ['iPhone SE', 'webkit'], ['iPhone 12', 'webkit'], ['iPhone 14 Pro Max', 'webkit'], ['iPhone 15', 'webkit'],
   ['Pixel 5', 'chromium'], ['Pixel 7', 'chromium'], ['Galaxy S9+', 'chromium'], ['Galaxy S8', 'chromium'], ['Galaxy A55', 'chromium'],
   ['iPad Mini', 'webkit'], ['Galaxy Tab S4', 'chromium'],
-].filter(([n]) => devices[n])
+].filter(([n]) => devices[n] && (!process.env.ONLY || process.env.ONLY.split(',').includes(n)))
 const skipped = ['iPhone SE', 'iPhone 12', 'iPhone 14 Pro Max', 'iPhone 15', 'Pixel 5', 'Pixel 7', 'Galaxy S9+', 'Galaxy S8', 'Galaxy A55', 'iPad Mini', 'Galaxy Tab S4'].filter((n) => !devices[n])
 
 const T = { timeout: 25000 }
@@ -69,6 +68,8 @@ async function signIn(page, email) {
 }
 
 const PNG = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR4nGP4z8DwHwAFAAH/q842iQAAAABJRU5ErkJggg==', 'base64')
+// The Firebase SDK adds a fixed warning banner when it talks to the local emulators. It does not exist in production, so it must not count as overflow.
+const HIDE_BANNER = () => document.addEventListener('DOMContentLoaded', () => { const st = document.createElement('style'); st.textContent = '.firebase-emulator-warning{display:none!important}'; document.head.append(st) })
 let failed = false
 try {
   for (const [name, engine] of MATRIX) {
@@ -78,16 +79,20 @@ try {
       const ctx = await browser.newContext({ ...devices[name], colorScheme: scheme, serviceWorkers: 'block' })
       const logs = []
       const wire = (p) => { p.on('console', (m) => { if (m.type() === 'error' && !/Failed to load resource|net::ERR|WebChannel|Could not reach/.test(m.text())) logs.push(m.text().slice(0, 200)) }); p.on('pageerror', (e) => logs.push(`pageerror: ${e.message}`)) }
+      await ctx.addInitScript(HIDE_BANNER)
       const page = await ctx.newPage()
       wire(page)
       const t0 = Date.now()
+      let stage = 'start'
       try {
         // reporter: landing -> 4-step flow -> tracking
+        stage = 'landing'
         await page.goto(BASE)
         await page.getByRole('button', { name: /Report an emergency/ }).first().waitFor(T)
         check((await page.evaluate(() => document.documentElement.dataset.theme)) === scheme, `${label}: theme should follow the device`)
         await audit(page, `${label} landing`)
         await page.screenshot({ path: `${OUT}${name.replace(/\W+/g, '-')}-${scheme}-1-landing.png`, fullPage: true })
+        stage = 'step 1'
         await page.getByRole('button', { name: /Report an emergency/ }).first().click()
         await page.getByRole('heading', { name: 'What happened' }).waitFor(T)
         await audit(page, `${label} step 1`)
@@ -96,6 +101,7 @@ try {
         await page.getByLabel('Pick a demo place').selectOption({ label: 'Kankanady' })
         await audit(page, `${label} step 2 (map)`)
         await page.getByRole('button', { name: 'Next' }).click()
+        stage = 'step 3 composer'
         await page.getByPlaceholder('Adult man, bitten on the leg, conscious').fill(`DEVICE TEST ${name} ${scheme}`)
         await page.locator('#ev-files').setInputFiles([{ name: 'scene.png', mimeType: 'image/png', buffer: PNG }])
         await page.locator('.tile').first().waitFor(T)
@@ -110,15 +116,21 @@ try {
         if (opened === 'dialog') { await audit(page, `${label} camera`); await page.getByRole('button', { name: 'Close the camera' }).click() }
         await page.getByRole('button', { name: 'Next' }).click()
         await audit(page, `${label} review`)
+        stage = 'sending'
         await page.getByRole('button', { name: 'Send to dispatch' }).click()
         await page.getByTestId('receipt-code').waitFor(T)
+        stage = 'waiting for the upload to be confirmed'
         await page.getByText('Evidence: 1 of 1 uploaded').waitFor({ timeout: 40000 })
         await audit(page, `${label} tracking`)
         await page.screenshot({ path: `${OUT}${name.replace(/\W+/g, '-')}-${scheme}-3-tracking.png`, fullPage: true })
 
         // each staff role, on the same device
         for (const [email, heading] of [['dispatcher1@goldenhour.demo', null], ['crew1@goldenhour.demo', 'Medic 1'], ['wenlock@goldenhour.demo', 'Wenlock District Hospital']]) {
-          const staff = await ctx.newPage()
+          stage = `staff ${email}`
+          // a separate context: staff must not share the reporter's browser session
+          const sctx = await browser.newContext({ ...devices[name], colorScheme: scheme, serviceWorkers: 'block' })
+          await sctx.addInitScript(HIDE_BANNER)
+          const staff = await sctx.newPage()
           wire(staff)
           await signIn(staff, email)
           if (heading) await staff.getByRole('heading', { name: heading }).waitFor(T)
@@ -131,13 +143,15 @@ try {
           await staff.goto(`${BASE}/#/account`)
           await staff.getByRole('heading', { name: 'Account and settings' }).waitFor(T)
           await audit(staff, `${label} account`)
-          await staff.close()
+          await sctx.close()
         }
         check(logs.length === 0, `${label}: console errors ${JSON.stringify(logs.slice(0, 3))}`)
         console.log(`  ${problems.some((p) => p.startsWith(label)) ? '✗' : '✓'} ${label} (${((Date.now() - t0) / 1000).toFixed(1)} s)`)
       } catch (e) {
-        problems.push(`${label}: ${String(e.message).split('\n')[0]}`)
-        console.log(`  ✗ ${label}: ${String(e.message).split('\n')[0]}`)
+        problems.push(`${label} [${stage}]: ${String(e.message).split('\n')[0]}`)
+        console.log(`  ✗ ${label} [${stage}]: ${String(e.message).split('\n')[0]}`)
+        if (logs.length) console.log(`      console: ${JSON.stringify(logs.slice(0, 4))}`)
+        console.log(`      on screen: ${JSON.stringify(await page.evaluate(() => [...document.querySelectorAll('.slip, [role=alert], .notice')].map((x) => x.textContent?.slice(0, 200))).catch(() => []))}`)
         await page.screenshot({ path: `${OUT}FAIL-${name.replace(/\W+/g, '-')}-${scheme}.png`, fullPage: true }).catch(() => undefined)
       }
       await ctx.close()

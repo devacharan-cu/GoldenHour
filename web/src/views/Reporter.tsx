@@ -242,12 +242,12 @@ export function ReportFlow({ notify, onSent, onCreated }: { notify: Notify; onSe
         await uploadQueue.add({ id: newId(), caseId: made.id, uid: actor.uid, role, evidenceId: newId(), name: f.file.name, mime: f.mime, kind: f.kind, size: f.file.size, origin: f.origin }, f.file)
       }
       files.forEach((f) => URL.revokeObjectURL(f.previewUrl))
-      made.done.then(() => void uploadQueue.process()).catch((e: Error) => notify(`The report could not be saved: ${e.message}`, 'bad'))
+      made.done.then(() => void uploadQueue.process()).catch((e: unknown) => notify(`The report could not be saved: ${(e as Error | null)?.message ?? 'the server did not accept it'}`, 'bad'))
       notify(online ? 'Report sent. Dispatch can see it now.' : 'Saved on this device only. It has NOT been sent, and will send when you are back online.', online ? 'good' : 'warn')
       if (onSent) onSent(made.id)
       onCreated(made)
     } catch (e) {
-      setError(`Could not send the report: ${(e as Error).message}`)
+      setError(`Could not send the report: ${(e as Error | null)?.message ?? 'unknown error'}`)
     } finally { setBusy(false) }
   }
 

@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import { db } from '../lib/firebase'
 import { classifyFile, compressImage, downloadEvidence, EvidenceIntegrityError, formatBytes, KIND_LABEL, MAX_BYTES, MAX_FILES_PER_REPORT } from '../lib/evidence'
+import { uploadQueue } from '../lib/queue'
 import { useOnline } from '../lib/store'
 import type { QueueItem } from '../lib/uploadQueue'
 import type { Evidence, EvidenceKind } from '../lib/types'
@@ -261,6 +262,7 @@ export function UploadList({ items, onRetry, onRemove }: { items: QueueItem[]; o
   return (
     <div className="stack-sm" aria-label="Evidence upload status">
       <div className="row row-between"><h3 className="h-sm">Evidence: {sent} of {items.length} uploaded</h3>{sent < items.length && !online && <DeviceStamp>Offline: waiting on this device</DeviceStamp>}</div>
+      {sent < items.length && !uploadQueue.isDurable() && <Notice tone="wait" title="Keep this page open">This browser would not save the files on your device, so they only exist in this tab until they are uploaded. Do not close or refresh it.</Notice>}
       <ul className="tiles">
         {items.map((i) => {
           const pct = i.total ? Math.round((i.done / i.total) * 100) : 0

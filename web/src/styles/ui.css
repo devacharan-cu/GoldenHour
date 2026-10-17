@@ -291,3 +291,7 @@ legend { padding: 0; }
 :root[data-theme='dark'] .google-btn { border-color: #8c8c8c; }
 .divider { display: flex; align-items: center; gap: 12px; color: var(--ink-3); font-size: .9rem; }
 .divider::before, .divider::after { content: ''; flex: 1; height: 2px; background: var(--line-soft); }
+
+/* A notice's text must never be squeezed into a sliver by its buttons: below ~14rem the buttons wrap onto their own line. */
+.notice > .grow { flex: 1 1 14rem; min-width: min(100%, 14rem); }
+.notice > .row { flex: 0 1 auto; }

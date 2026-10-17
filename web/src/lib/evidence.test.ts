@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { CHUNK_SIZE, classifyFile, formatBytes, MAX_BYTES, splitBytes } from './evidence'
 import { formatReceipt, parseReceipt, randomSecret, sha256Hex } from './crypto'
-import { MemoryStore, UploadQueue, type QueueItem } from './uploadQueue'
+import { MemoryStore, ResilientStore, UploadQueue, type QueueItem } from './uploadQueue'
 
 const MB = 1024 * 1024
 
@@ -158,5 +158,22 @@ describe('upload queue states', () => {
     expect(theirs.snapshot()).toEqual([])
     await mine.wipe()
     expect(await store.all()).toEqual([])
+  })
+})
+
+describe('device storage that the browser refuses', () => {
+  it('keeps evidence in memory, never throws, and says the files are not durable (this test environment has no IndexedDB)', async () => {
+    let sent = 0
+    const q = new UploadQueue(new ResilientStore(), async (_i, data) => { expect(data.length).toBe(3); sent++ })
+    await q.add({ id: 'a', caseId: 'c', uid: 'u', role: 'reporter', evidenceId: 'e', name: 'x.png', mime: 'image/png', kind: 'image', size: 3, origin: 'file' }, new Blob([new Uint8Array([1, 2, 3])]))
+    expect(q.isDurable()).toBe(false)
+    await q.process()
+    expect(sent).toBe(1)
+    expect(q.snapshot()[0].state).toBe('uploaded')
+  })
+  it('turns a null rejection into a readable upload error instead of crashing', async () => {
+    const { friendlyUploadError } = await import('./uploadQueue')
+    expect(friendlyUploadError(null)).toBe('Upload failed.')
+    expect(friendlyUploadError(undefined)).toBe('Upload failed.')
   })
 })

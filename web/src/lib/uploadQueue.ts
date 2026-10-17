@@ -64,11 +64,48 @@ export class IdbStore implements QueueStore {
       t.onerror = () => { db.close(); rej(t.error) }
     })
   }
-  async put(item: QueueItem, blob?: Blob) { await this.tx(['items', 'blobs'], 'readwrite', (t) => { t.objectStore('items').put(item); if (blob) t.objectStore('blobs').put(blob, item.id) }) }
-  async getBlob(id: string) { return (await this.tx<Blob>(['blobs'], 'readonly', (t) => t.objectStore('blobs').get(id))) ?? undefined }
+  // Bytes are stored as an ArrayBuffer plus its type rather than a Blob/File: that works in every browser engine, including Safari
+  // builds that cannot keep Blobs in IndexedDB.
+  async put(item: QueueItem, blob?: Blob) {
+    const bytes = blob ? { buf: await blob.arrayBuffer(), type: blob.type } : undefined
+    await this.tx(['items', 'blobs'], 'readwrite', (t) => { t.objectStore('items').put(item); if (bytes) t.objectStore('blobs').put(bytes, item.id) })
+  }
+  async getBlob(id: string) {
+    const v = await this.tx<{ buf: ArrayBuffer; type: string }>(['blobs'], 'readonly', (t) => t.objectStore('blobs').get(id))
+    return v ? new Blob([v.buf], { type: v.type }) : undefined
+  }
   async dropBlob(id: string) { await this.tx(['blobs'], 'readwrite', (t) => { t.objectStore('blobs').delete(id) }) }
   async all() { return ((await this.tx<QueueItem[]>(['items'], 'readonly', (t) => t.objectStore('items').getAll())) ?? []) as QueueItem[] }
   async clear() { await this.tx(['items', 'blobs'], 'readwrite', (t) => { t.objectStore('items').clear(); t.objectStore('blobs').clear() }) }
+}
+
+/**
+ * Durable storage when the browser allows it, otherwise this tab's memory. It never throws: evidence must not be lost, or the report blocked,
+ * because the browser refuses IndexedDB (private browsing, storage pressure, an engine quirk). When it falls back, `durable` turns false and
+ * the screen says plainly that the files are kept in this tab only until they are uploaded.
+ */
+export class ResilientStore implements QueueStore {
+  durable = true
+  private idb = new IdbStore()
+  private mem = new MemoryStore()
+  private fail(e: unknown) { this.durable = false; console.warn('[uploads] device storage unavailable, keeping files in memory:', e instanceof Error ? e.message : e) }
+  async put(item: QueueItem, blob?: Blob) {
+    await this.mem.put(item, blob)
+    try { await this.idb.put(item, blob) } catch (e) { this.fail(e) }
+  }
+  async getBlob(id: string) {
+    const m = await this.mem.getBlob(id)
+    if (m) return m
+    try { return await this.idb.getBlob(id) } catch (e) { this.fail(e); return undefined }
+  }
+  async dropBlob(id: string) { await this.mem.dropBlob(id); try { await this.idb.dropBlob(id) } catch (e) { this.fail(e) } }
+  async all() {
+    const seen = new Map<string, QueueItem>()
+    try { for (const i of await this.idb.all()) seen.set(i.id, i) } catch (e) { this.fail(e) }
+    for (const i of await this.mem.all()) seen.set(i.id, i)
+    return [...seen.values()]
+  }
+  async clear() { await this.mem.clear(); try { await this.idb.clear() } catch (e) { this.fail(e) } }
 }
 
 export type Uploader = (item: QueueItem, data: Uint8Array, onProgress: (done: number, total: number) => void) => Promise<void>
@@ -88,6 +125,9 @@ export class UploadQueue {
     this.isOnline = isOnline
     this.caseReady = caseReady
   }
+
+  /** False when the browser would not let us save files on the device: they then survive only while this tab stays open. */
+  isDurable(): boolean { return (this.store as { durable?: boolean }).durable !== false }
 
   subscribe(fn: () => void): () => void { this.listeners.add(fn); return () => this.listeners.delete(fn) }
   private emit() { this.listeners.forEach((f) => f()) }
@@ -163,7 +203,7 @@ export class UploadQueue {
 }
 
 export function friendlyUploadError(e: unknown): string {
-  const msg = (e as { code?: string; message?: string })
+  const msg = (e ?? {}) as { code?: string; message?: string }
   if (msg.code === 'permission-denied') return 'The server refused this file. It may be too large, an unsupported type, or the case is closed.'
   if (msg.code === 'unavailable' || /network|offline/i.test(msg.message ?? '')) return 'No connection. It will retry when you are back online.'
   return msg.message ?? 'Upload failed.'

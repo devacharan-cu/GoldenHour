@@ -2,7 +2,7 @@ import { useEffect, useSyncExternalStore } from 'react'
 import { doc, getDocFromServer } from 'firebase/firestore'
 import { db } from './firebase'
 import { uploadEvidence } from './evidence'
-import { IdbStore, MemoryStore, UploadQueue, type QueueItem } from './uploadQueue'
+import { MemoryStore, ResilientStore, UploadQueue, type QueueItem } from './uploadQueue'
 
 const confirmedCases = new Set<string>()
 
@@ -11,7 +11,7 @@ const confirmedCases = new Set<string>()
  * part of them. It is wiped on sign-out (see wipeLocalData) so the next person on the device never sees it.
  */
 export const uploadQueue = new UploadQueue(
-  typeof indexedDB === 'undefined' ? new MemoryStore() : new IdbStore(),
+  typeof indexedDB === 'undefined' ? new MemoryStore() : new ResilientStore(),
   (item, data, onProgress) =>
     uploadEvidence(db, { uid: item.uid, role: item.role }, item.caseId, item.evidenceId, data, { name: item.name, mime: item.mime, kind: item.kind, origin: item.origin }, onProgress),
   () => navigator.onLine,
