@@ -295,3 +295,13 @@ legend { padding: 0; }
 /* A notice's text must never be squeezed into a sliver by its buttons: below ~14rem the buttons wrap onto their own line. */
 .notice > .grow { flex: 1 1 14rem; min-width: min(100%, 14rem); }
 .notice > .row { flex: 0 1 auto; }
+
+/* Very narrow phones (320 px wide): the top bar must still fit brand, status, theme button and account avatar. */
+@media (max-width: 380px) {
+  .rail-inner { gap: 8px; padding: 8px 10px; }
+  .brand { gap: 6px; }
+  .brand-name { font-size: 1.25rem; }
+  .brand-mark { width: 30px; height: 30px; }
+  .conn { font-size: 0; gap: 0; }   /* keep the coloured status dot, drop the word */
+  .conn i { width: 11px; height: 11px; }
+}
