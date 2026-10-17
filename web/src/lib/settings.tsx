@@ -52,7 +52,7 @@ export function applySettings(s: Settings): void {
   el.dataset.text = s.textSize
   el.dataset.motion = s.reduceMotion === 'on' ? 'reduced' : 'system'
   el.dataset.compact = s.compact ? 'on' : 'off'
-  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', theme === 'dark' ? '#0b1522' : '#e8edf1')
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', theme === 'dark' ? '#000000' : '#e8edf1')
 }
 
 interface Ctx { settings: Settings; set: (patch: Partial<Settings>) => void; reset: () => void; theme: 'light' | 'dark' }

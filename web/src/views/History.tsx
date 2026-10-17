@@ -5,7 +5,7 @@ import { Empty, ErrorBox, GoldenRing, Icon, Panel, Pill, SeverityTag, StatusPill
 import { CASE_TYPES } from '../lib/capabilities'
 import { formatClock } from '../lib/geo'
 import { useCaseById, useCaseHistory, useEvents, useEvidence } from '../lib/store'
-import type { Ambulance, Case, CaseStatus, CaseType, Hospital, Offer, UserProfile } from '../lib/types'
+import { CLOSE_LABEL, closeKindOf, type Ambulance, type Case, type CaseStatus, type CaseType, type Hospital, type Offer, type UserProfile } from '../lib/types'
 import { filterCases } from '../lib/history'
 import { Workbench } from './Dispatcher'
 import type { Actor } from '../lib/workflow'
@@ -79,7 +79,7 @@ export default function History({ profile, uid, actor, hospitals, ambulances, of
       <Panel title="Find a case" quiet>
         <div className="filters">
           <label className="field"><span className="field-label">Search</span><input type="search" value={f.q} onChange={(e) => set({ q: e.target.value })} placeholder="Summary, hospital, crew, case ID" /></label>
-          <label className="field"><span className="field-label">Status</span><select value={f.status} onChange={(e) => set({ status: e.target.value })}><option value="all">All</option><option value="open">Open</option><option value="closed">Closed</option><option value="completed">Completed with handover</option><option value="cancelled">Cancelled</option></select></label>
+          <label className="field"><span className="field-label">Status</span><select value={f.status} onChange={(e) => set({ status: e.target.value })}><option value="all">All</option><option value="open">Open</option><option value="closed">Closed</option><option value="completed">Completed with handover</option><option value="cancelled">Ended without a hospital</option><option value="false">False reports</option><option value="accidental">Accidental reports</option><option value="duplicate">Duplicates</option><option value="withdrawn">Withdrawn by reporter</option></select></label>
           <label className="field"><span className="field-label">Type</span><select value={f.type} onChange={(e) => set({ type: e.target.value })}><option value="all">All types</option>{(Object.keys(CASE_TYPES) as CaseType[]).map((t) => <option key={t} value={t}>{CASE_TYPES[t].label}</option>)}</select></label>
           <label className="field"><span className="field-label">Severity</span><select value={f.severity} onChange={(e) => set({ severity: e.target.value })}><option value="all">Any</option><option value="1">Critical</option><option value="2">Serious</option><option value="3">Stable</option></select></label>
           <label className="field"><span className="field-label">From</span><input type="date" value={f.from} onChange={(e) => set({ from: e.target.value })} /></label>
@@ -98,7 +98,7 @@ export default function History({ profile, uid, actor, hospitals, ambulances, of
             <button key={c.id} className="rows-row" role="row" style={{ ['--cols' as string]: '9rem minmax(0, 2fr) 11rem minmax(0, 1.2fr) 6rem' }} onClick={() => onOpen(c.id)}>
               <span className="num">{dt(c.createdAtMs)}</span>
               <span><b><Icon name={TYPE_ICON[c.type]} size={16} /> {CASE_TYPES[c.type].label}</b> <SeverityTag severity={c.severity} /><br /><span className="sub">{c.brief || 'No summary'}</span></span>
-              <span><StatusPill status={c.status as CaseStatus} />{c.status === 'closed' && <><br /><span className="fine">{c.arrivalConfirmedAtMs ? 'Handed over' : 'Cancelled'}</span></>}</span>
+              <span><StatusPill status={c.status as CaseStatus} />{c.status === 'closed' && <><br /><span className="fine">{c.arrivalConfirmedAtMs ? 'Handed over' : CLOSE_LABEL[closeKindOf(c) ?? 'cancelled']}</span></>}</span>
               <span className="cell-hide sub">{c.ambulanceCallSign ?? 'No crew'}<br />{c.selectedHospitalName ?? 'No hospital'}</span>
               <span className="cell-hide num">{duration(c) ?? <Pill tone="wait">Open</Pill>}</span>
             </button>

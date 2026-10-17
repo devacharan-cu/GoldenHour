@@ -4,6 +4,7 @@ import { classifyFile, compressImage, downloadEvidence, EvidenceIntegrityError, 
 import { useOnline } from '../lib/store'
 import type { QueueItem } from '../lib/uploadQueue'
 import type { Evidence, EvidenceKind } from '../lib/types'
+import { CameraCapture, cameraSupported, type CameraMode } from './Camera'
 import { DeviceStamp, Icon, KIND_ICON, Notice, Pill } from './ui'
 
 const ORIGIN_LABEL = { camera: 'Taken with the camera', recorder: 'Recorded in the app', file: 'Chosen from files' } as const
@@ -107,6 +108,7 @@ export function EvidenceComposer({ files, onChange, disabled }: { files: LocalFi
   const [busy, setBusy] = useState(false)
   const [over, setOver] = useState(false)
   const [rec, setRec] = useState<{ seconds: number } | null>(null)
+  const [camera, setCamera] = useState<CameraMode | null>(null)
   const recorder = useRef<{ mr: MediaRecorder; stream: MediaStream; chunks: Blob[]; timer: ReturnType<typeof setInterval> } | null>(null)
   const filesRef = useRef(files)
   useEffect(() => { filesRef.current = files })
@@ -182,17 +184,28 @@ export function EvidenceComposer({ files, onChange, disabled }: { files: LocalFi
       onChange={(e) => { if (e.target.files?.length) void add(e.target.files, props.origin); e.target.value = '' }} />
   )
 
+  // Camera buttons open the live in-app camera. Without a camera API we hand over to the phone's own camera app.
+  const openCamera = (mode: CameraMode) => { setProblems([]); if (cameraSupported()) setCamera(mode); else document.getElementById(mode === 'photo' ? 'ev-photo' : 'ev-video')?.click() }
+
   return (
     <div className="stack">
+      {camera && (
+        <CameraCapture mode={camera}
+          onClose={() => setCamera(null)}
+          onFallback={() => { const m = camera; setCamera(null); document.getElementById(m === 'photo' ? 'ev-photo' : 'ev-video')?.click() }}
+          onDone={(file) => { setCamera(null); void add([file], 'camera') }} />
+      )}
       <div className="stack-sm">
         <div className="row">
-          <label className="btn" htmlFor="ev-photo"><Icon name="camera" /> Take a photo</label>
-          <label className="btn" htmlFor="ev-video"><Icon name="video" /> Record a video</label>
+          <button type="button" className="btn" onClick={() => openCamera('photo')} disabled={disabled || busy || !!rec}><Icon name="camera" /> Take a photo</button>
+          <button type="button" className="btn" onClick={() => openCamera('video')} disabled={disabled || busy || !!rec}><Icon name="video" /> Record a video</button>
           <button type="button" className="btn" onClick={() => void startRecording()} disabled={disabled || busy || !!rec}><Icon name="mic" /> Record a voice note</button>
-          <label className="btn" htmlFor="ev-files"><Icon name="upload" /> Choose files</label>
+          <label className="btn" htmlFor="ev-gallery"><Icon name="photo" /> Photo or video from gallery</label>
+          <label className="btn" htmlFor="ev-files"><Icon name="file" /> PDF or audio file</label>
         </div>
         {input({ id: 'ev-photo', accept: 'image/*', capture: 'environment', origin: 'camera' })}
         {input({ id: 'ev-video', accept: 'video/*', capture: 'environment', origin: 'camera' })}
+        {input({ id: 'ev-gallery', accept: 'image/jpeg,image/png,image/webp,video/mp4,video/webm,video/quicktime,video/3gpp', multiple: true, origin: 'file' })}
         {input({ id: 'ev-files', accept: ACCEPT, multiple: true, origin: 'file' })}
         <p className="hint">Photos (JPEG, PNG, WebP up to {formatBytes(MAX_BYTES.image)}, shrunk on your device), PDFs up to {formatBytes(MAX_BYTES.document)}, audio up to {formatBytes(MAX_BYTES.audio)}, video up to {formatBytes(MAX_BYTES.video)}. Up to {MAX_FILES_PER_REPORT} files.</p>
       </div>

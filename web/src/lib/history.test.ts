@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { filterCases, searchText } from './history'
 import { mkCase, T0 } from './fixtures'
+import { closeKindOf } from './types'
 
 const none = { q: '', status: 'all', type: 'all', severity: 'all', from: '', to: '' }
 const day = 86_400_000
@@ -35,6 +36,21 @@ describe('incident history filters', () => {
     const d = (ms: number) => new Date(ms).toISOString().slice(0, 10)
     expect(filterCases(rows, { ...none, from: d(T0 - 4 * day), to: d(T0) }).map((c) => c.id[0]).sort()).toEqual(['a', 'b'])
     expect(filterCases(rows, { ...none, from: d(T0 + day) })).toEqual([])
+  })
+  it('tells false, accidental, duplicate and withdrawn reports apart', () => {
+    const closed = (closeReason: string, extra = {}) => mkCase({ status: 'closed', closedAtMs: T0, closeReason, ...extra })
+    const set = [
+      closed('False report: prank call'), closed('Accidental report: pocket dial'), closed('Duplicate report', { duplicateOf: 'x' }),
+      closed('Withdrawn by reporter: Sent by mistake'), closed('Cancelled: patient declined care'), closed('Handed over to the hospital', { arrivalConfirmedAtMs: T0 }),
+    ]
+    const ids = (status: string) => filterCases(set, { ...none, status }).map((c) => c.closeReason?.split(':')[0])
+    expect(ids('false')).toEqual(['False report'])
+    expect(ids('accidental')).toEqual(['Accidental report'])
+    expect(ids('duplicate')).toEqual(['Duplicate report'])
+    expect(ids('withdrawn')).toEqual(['Withdrawn by reporter'])
+    expect(closeKindOf(set[4])).toBe('cancelled')
+    expect(closeKindOf(set[5])).toBe('completed')
+    expect(closeKindOf(mkCase({ status: 'enroute' }))).toBeNull()
   })
   it('builds searchable text without crashing on missing fields', () => {
     expect(searchText(mkCase({ selectedHospitalName: null, closeReason: null }))).toContain('trauma')

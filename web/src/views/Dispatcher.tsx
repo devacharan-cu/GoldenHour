@@ -5,14 +5,14 @@ import MapView from '../components/MapView'
 import { Elapsed, Empty, ErrorBox, GoldenRing, Icon, Notice, OfferPill, Panel, Pill, PosSource, RelayTrack, SeverityTag, StatusPill, Timeline, TYPE_ICON, type Notify } from '../components/ui'
 import { CAPABILITY_LABEL, CASE_TYPES } from '../lib/capabilities'
 import { findDuplicates } from '../lib/duplicates'
-import { agoText, estimateMinutes } from '../lib/geo'
+import { agoText, distanceKm, estimateMinutes } from '../lib/geo'
 import { db } from '../lib/firebase'
-import { explainRecommendation, nearestFreeAmbulance, nextWave, offerStatusText, rankQualified, WAVE_SIZE } from '../lib/matching'
+import { eligibility, explainRecommendation, nearestFreeAmbulance, nextWave, offerStatusText, rankQualified, WAVE_SIZE } from '../lib/matching'
 import { nextMover } from '../lib/relay'
 import { etasFrom } from '../lib/routing'
 import { useEvents, useEvidence, useNow, usePatientPrivate } from '../lib/store'
 import type { Ambulance, Case, Hospital, Offer, OfferState } from '../lib/types'
-import { cancelAssignment, closeCase, contactNextWave, dismissDuplicate, dispatchCase, extendDeadline, markDuplicate, selectDestination, type Actor } from '../lib/workflow'
+import { askHospital, canCancelStatus, cancelAssignment, cancelCase, closeCase, contactNextWave, dismissDuplicate, dispatchCase, extendDeadline, markDuplicate, selectDestination, type Actor } from '../lib/workflow'
 
 interface Props {
   cases: Case[]
@@ -98,6 +98,32 @@ function CrewPanel({ c, hospitals, ambulances, actor, notify, move }: { c: Case;
 
 // ---------------------------------------------------------------- step: hospitals and destination
 
+/** A declining hospital's suggestion. Dispatch may ask that hospital if it is eligible; it must still accept and confirm like any other. */
+function Suggestion({ c, from, hospitals, offers, actor, notify }: { c: Case; from: Offer; hospitals: Hospital[]; offers: Offer[]; actor: Actor; notify: Notify }) {
+  const [busy, setBusy] = useState(false)
+  const h = hospitals.find((x) => x.id === from.suggestedHospitalId)
+  if (!h) return null
+  const existing = offers.find((x) => x.hospitalId === h.id)
+  const { eligible, excluded } = eligibility(c, [h])
+  const why = excluded[0]?.reason
+  return (
+    <div className="inset" data-testid="suggestion">
+      <p className="sub"><b>{from.hospitalName}</b> suggests <b>{h.name}</b> instead. This is a suggestion only.</p>
+      {existing ? <p className="fine">{h.name} has already been asked: {existing.state === 'pending' ? 'waiting for its answer' : existing.state}.</p>
+        : !eligible.length ? <p className="fine">Not eligible for this patient: {why}.</p>
+        : c.selectedHospitalId || c.status === 'closed' ? <p className="fine">A destination is already confirmed.</p>
+        : <button className="btn btn-sm btn-ink" disabled={busy} onClick={async () => {
+          setBusy(true)
+          try {
+            const e = estimateMinutes(c, h)
+            const ok = await askHospital(db, actor, c, { hospital: h, distanceKm: Math.round(distanceKm(c, h) * 10) / 10, etaMin: e, etaSource: 'estimate' }, `suggested by ${from.hospitalName}`)
+            notify(ok ? `${h.name} has been asked. It must accept and confirm before it can be chosen.` : `${h.name} was already asked.`, ok ? 'good' : 'warn')
+          } catch (err) { notify((err as Error).message, 'warn') } finally { setBusy(false) }
+        }}>Ask {h.name} now</button>}
+    </div>
+  )
+}
+
 function HospitalPanel({ c, offers, hospitals, actor, notify, move }: { c: Case; offers: Offer[]; hospitals: Hospital[]; actor: Actor; notify: Notify; move: boolean }) {
   const now = useNow()
   const [choice, setChoice] = useState('')
@@ -131,6 +157,7 @@ function HospitalPanel({ c, offers, hospitals, actor, notify, move }: { c: Case;
               <li key={o.id} className={`offer ${o.state}`}>
                 <div className="row row-between"><div><b>{o.hospitalName}</b><span className="fine"> wave {o.wave}{o.respondedAtMs ? `, answered in ${Math.round((o.respondedAtMs - o.requestedAtMs) / 1000)} s` : ''}</span></div><OfferPill state={o.state} /></div>
                 <p className="sub">{offerStatusText(o, c, now)}{o.state === 'pending' && o.expiresAtMs > now ? ` Deadline in ${Math.ceil((o.expiresAtMs - now) / 1000)} s.` : ''}</p>
+                {o.state === 'declined' && o.suggestedHospitalId && <Suggestion c={c} from={o} hospitals={hospitals} offers={offers} actor={actor} notify={notify} />}
                 <div className="row row-tight">
                   {o.seenAtMs ? <Pill tone="go">Opened {agoText(o.seenAtMs, now)}</Pill> : <Pill>Not opened yet</Pill>}
                   <Pill tone="star">{o.etaMin} min{o.etaSource === 'estimate' ? ' (est.)' : ''}, {o.distanceKm} km from the scene</Pill>
@@ -173,6 +200,59 @@ function HospitalPanel({ c, offers, hospitals, actor, notify, move }: { c: Case;
   )
 }
 
+
+// ---------------------------------------------------------------- ending a case that will not reach a hospital
+
+const END_KINDS = [
+  ['false', 'False report', 'A prank, a test or a deliberately wrong report.'],
+  ['accidental', 'Accidental report', 'Sent by mistake or no longer needed.'],
+  ['duplicate', 'Duplicate of another case', 'The same emergency was reported twice.'],
+  ['cancelled', 'Cancelled', 'Patient declined care or it was resolved at the scene.'],
+] as const
+
+function EndCasePanel({ c, others, offers, actor, notify }: { c: Case; others: Case[]; offers: Offer[]; actor: Actor; notify: Notify }) {
+  const [open, setOpen] = useState(false)
+  const [kind, setKind] = useState<(typeof END_KINDS)[number][0]>('false')
+  const [note, setNote] = useState('')
+  const [dupOf, setDupOf] = useState('')
+  const [sure, setSure] = useState(false)
+  const [busy, setBusy] = useState(false)
+  const allowed = canCancelStatus(c.status)
+  if (c.status === 'arrived') return null // the hand-over panel closes arrived cases
+  if (!open) return <button className="btn btn-danger btn-sm" style={{ justifySelf: 'start' }} onClick={() => setOpen(true)} disabled={!allowed} title={allowed ? undefined : 'The patient is already on board. Finish the hand-over instead.'}>End this case without a hospital</button>
+  const target = others.find((x) => x.id === dupOf)
+  const ready = sure && (kind === 'duplicate' ? !!target : note.trim().length >= 3)
+  async function submit() {
+    setBusy(true)
+    try {
+      if (kind === 'duplicate') await markDuplicate(db, actor, c, target as Case)
+      else await cancelCase(db, actor, c, kind, note, offers)
+      notify(kind === 'duplicate' ? 'Merged as a duplicate and closed.' : 'Case ended. The ambulance is free and hospitals are stood down.', 'good')
+    } catch (e) { notify((e as Error).message, 'warn'); setBusy(false) }
+  }
+  return (
+    <Panel title="End this case without a hospital" quiet>
+      <p className="sub measure">Nothing is deleted. The case stays in History with your reason, the ambulance is released and any hospital that was asked is stood down. Not possible once the patient is on board.</p>
+      <fieldset className="stack-sm" style={{ border: 0, padding: 0, margin: 0 }}>
+        <legend className="field-label">Why is it ending?</legend>
+        {END_KINDS.map(([v, label, hint]) => (
+          <label key={v} className="choice"><input type="radio" name="end-kind" checked={kind === v} onChange={() => { setKind(v); setSure(false) }} /><span><span className="strong">{label}</span><br /><span className="fine">{hint}</span></span></label>
+        ))}
+      </fieldset>
+      {kind === 'duplicate' ? (
+        <label className="field"><span className="field-label">Which open case is it a duplicate of?</span>
+          <select value={dupOf} onChange={(e) => setDupOf(e.target.value)}><option value="">Choose a case</option>{others.map((x) => <option key={x.id} value={x.id}>{CASE_TYPES[x.type].label} {x.id.slice(0, 5)}: {x.brief.slice(0, 40) || 'no summary'}</option>)}</select>
+          {others.length === 0 && <span className="hint">There is no other open case.</span>}
+        </label>
+      ) : (
+        <label className="field"><span className="field-label">Reason (kept in the audit trail)</span><textarea rows={2} maxLength={160} value={note} onChange={(e) => setNote(e.target.value)} placeholder={kind === 'false' ? 'What made you sure it is false?' : 'A short note for the record'} /></label>
+      )}
+      <label className="choice"><input type="checkbox" checked={sure} onChange={(e) => setSure(e.target.checked)} /><span>I understand this ends the case{c.ambulanceCallSign ? ` and frees ${c.ambulanceCallSign}` : ''}.</span></label>
+      <div className="row"><button className="btn btn-danger" disabled={busy || !ready || !allowed} onClick={() => void submit()}>{busy ? <><span className="spin" /> Ending</> : 'End the case'}</button><button className="btn" onClick={() => { setOpen(false); setSure(false) }}>Keep it open</button></div>
+    </Panel>
+  )
+}
+
 // ---------------------------------------------------------------- the case workbench
 
 export function Workbench({ c, allCases, offers, hospitals, ambulances, actor, notify }: { c: Case; allCases: Case[]; offers: Offer[]; hospitals: Hospital[]; ambulances: Ambulance[]; actor: Actor; notify: Notify }) {
@@ -181,8 +261,6 @@ export function Workbench({ c, allCases, offers, hospitals, ambulances, actor, n
   const evidence = useEvidence(c.id)
   const priv = usePatientPrivate(c.id, true)
   const [busy, setBusy] = useState(false)
-  const [cancelling, setCancelling] = useState(false)
-  const [cancelWhy, setCancelWhy] = useState('False alarm')
   const t = CASE_TYPES[c.type]
   const mover = nextMover(c, offers)
   const mine = mover.role === 'dispatcher'
@@ -231,15 +309,7 @@ export function Workbench({ c, allCases, offers, hospitals, ambulances, actor, n
             </Panel>
           )}
 
-          {live && c.status !== 'arrived' && (
-            cancelling ? (
-              <Panel title="Cancel this case" quiet>
-                <p className="sub">The ambulance will be freed and hospitals stood down. Use this only when the case will not reach a hospital.</p>
-                <label className="field"><span className="field-label">Reason</span><select value={cancelWhy} onChange={(e) => setCancelWhy(e.target.value)}>{['False alarm', 'Patient declined care', 'Resolved at the scene', 'Reported in error', 'Other'].map((r) => <option key={r}>{r}</option>)}</select></label>
-                <div className="row"><button className="btn btn-danger" disabled={busy} onClick={() => act(() => closeCase(db, actor, c, `Cancelled: ${cancelWhy}`), 'Case cancelled.')}>Cancel the case</button><button className="btn" onClick={() => setCancelling(false)}>Keep it open</button></div>
-              </Panel>
-            ) : <button className="btn btn-danger btn-sm" style={{ justifySelf: 'start' }} onClick={() => setCancelling(true)}>Cancel this case</button>
-          )}
+          {live && <EndCasePanel c={c} others={allCases.filter((x) => x.id !== c.id && x.status !== 'closed')} offers={offers} actor={actor} notify={notify} />}
 
           <Panel title="Timeline" quiet>{events.error ? <ErrorBox>{events.error}</ErrorBox> : <Timeline items={events.data} loading={!events.ready} />}</Panel>
         </div>

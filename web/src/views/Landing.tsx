@@ -1,5 +1,6 @@
 import { useRef, useState } from 'react'
 import { ErrorBox, Icon, InstallHint, Notice, Panel, RelayTrack } from '../components/ui'
+import { CreateAccountForm, GoogleButton } from '../components/AccountForms'
 import { friendlyAuthError, useAuth } from '../lib/auth'
 import { parseReceipt } from '../lib/crypto'
 
@@ -11,6 +12,8 @@ function SignIn() {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [forgot, setForgot] = useState(false)
+  const [creating, setCreating] = useState(false)
+  const { roleState } = useAuth()
   const [resetNote, setResetNote] = useState<string | null>(null)
 
   async function submit(e: React.FormEvent) {
@@ -31,12 +34,19 @@ function SignIn() {
   }
 
   return (
-    <Panel title={forgot ? 'Reset your password' : 'Staff sign in'}>
-      <p className="sub measure">Dispatchers, ambulance crews and hospital teams. Accounts are issued by an administrator, so there is no sign-up.</p>
+    <Panel title={forgot ? 'Reset your password' : creating ? 'Create an account' : 'Sign in'}>
+      {!creating && <p className="sub measure">Dispatchers, ambulance crews and hospital teams sign in here with the account an administrator gave them. Anyone else can report as a guest, or sign in to keep their reports across devices.</p>}
       {error && <ErrorBox>{error}</ErrorBox>}
       {resetNote && <Notice tone="go" title="Check your inbox">{resetNote}</Notice>}
-      {!forgot ? (
-        <form className="stack" onSubmit={submit} aria-label="Staff sign in">
+      {creating ? (
+        <>
+          <CreateAccountForm guest={roleState === 'guest'} />
+          <div className="divider"><span>or</span></div>
+          <GoogleButton label="Sign up with Google" />
+          <button type="button" className="btn btn-quiet" onClick={() => setCreating(false)}>I already have an account</button>
+        </>
+      ) : !forgot ? (
+        <form className="stack" onSubmit={submit} aria-label="Sign in">
           <label className="field"><span className="field-label">Email</span>
             <input id="signin-email" type="email" name="email" autoComplete="username" inputMode="email" required value={email} onChange={(e) => setEmail(e.target.value)} aria-invalid={!!error} />
           </label>
@@ -48,7 +58,12 @@ function SignIn() {
             </div>
           </div>
           <button className="btn btn-ink btn-lg" disabled={busy}>{busy ? <><span className="spin" /> Signing in</> : 'Sign in'}</button>
-          <button type="button" className="btn btn-quiet" onClick={() => { setForgot(true); setError(null) }}>Forgot your password?</button>
+          <div className="divider"><span>or</span></div>
+          <GoogleButton />
+          <div className="row row-between">
+            <button type="button" className="btn btn-quiet" onClick={() => { setForgot(true); setError(null) }}>Forgot your password?</button>
+            <button type="button" className="btn btn-quiet" onClick={() => { setCreating(true); setError(null) }}>Create an account</button>
+          </div>
         </form>
       ) : (
         <form className="stack" onSubmit={reset} aria-label="Reset password">
@@ -88,7 +103,7 @@ export default function Landing({ onReport, onOpenReceipt, hasOpenReports, onMin
           </div>
           <div className="row">
             <button className="btn btn-go btn-lg" onClick={onReport}><Icon name="alert" /> Report an emergency</button>
-            <button className="btn btn-lg" onClick={() => { signInRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }); document.getElementById('signin-email')?.focus() }}>Staff sign in</button>
+            <button className="btn btn-lg" onClick={() => { signInRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' }); document.getElementById('signin-email')?.focus() }}>Sign in or sign up</button>
             {hasOpenReports && <button className="btn btn-lg btn-quiet" onClick={onMine}>Your reports</button>}
           </div>
           <p className="fine measure">In a real emergency in India, call 112. This is a demonstration system and is not used for real dispatch.</p>

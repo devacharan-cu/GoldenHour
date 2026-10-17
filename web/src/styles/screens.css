@@ -70,7 +70,7 @@
 @media (max-width: 560px) { .theme-cards { grid-template-columns: 1fr; } .theme-card { grid-template-columns: 84px 1fr; align-items: center; min-height: 64px; } }
 .theme-swatch { height: 40px; border: 2px solid var(--line); display: grid; grid-template-columns: 1fr 1fr; }
 .theme-swatch.light { background: #e8edf1; } .theme-swatch.light i { background: #fff; border-left: 2px solid #0b1a2c; }
-.theme-swatch.dark { background: #0a1420; } .theme-swatch.dark i { background: #111e2f; border-left: 2px solid #8fa6c2; }
-.theme-swatch.system { background: linear-gradient(90deg, #e8edf1 50%, #0a1420 50%); }
+.theme-swatch.dark { background: #000; } .theme-swatch.dark i { background: #141414; border-left: 2px solid #8c8c8c; }
+.theme-swatch.system { background: linear-gradient(90deg, #e8edf1 50%, #000 50%); }
 .profile-head { display: flex; gap: 16px; align-items: center; }
 .profile-badge { width: 72px; height: 72px; background: var(--ink); color: var(--paper); display: grid; place-items: center; font-stretch: 75%; font-weight: 850; font-size: 2rem; clip-path: polygon(0 0, calc(100% - 16px) 0, 100% 16px, 100% 100%, 0 100%); flex: none; }

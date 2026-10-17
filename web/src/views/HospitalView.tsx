@@ -6,7 +6,7 @@ import { Empty, ErrorBox, GoldenRing, Icon, Notice, OfferPill, Panel, Pill, PosS
 import { CAPABILITIES, CAPABILITY_LABEL, CASE_TYPES, DECLINE_REASONS, confirmationPrompt } from '../lib/capabilities'
 import { agoText, estimateMinutes } from '../lib/geo'
 import { db } from '../lib/firebase'
-import { STALE_AVAILABILITY_MS } from '../lib/matching'
+import { eligibility, STALE_AVAILABILITY_MS } from '../lib/matching'
 import { useEvidence, useNow, usePatientPrivate } from '../lib/store'
 import type { Capability, Case, Hospital, Offer, UserProfile } from '../lib/types'
 import { confirmArrival, confirmAvailability, markOfferSeen, respondToOffer, revokeOffer, updateHospitalProfile, type Actor } from '../lib/workflow'
@@ -17,6 +17,7 @@ interface Props {
   hospital: Hospital | undefined
   cases: Case[]
   offers: Offer[]
+  hospitals: Hospital[]
   notify: Notify
   selected: string | null
   onSelect: (id: string | null) => void
@@ -26,7 +27,7 @@ const hm = (ms: number) => new Date(ms).toLocaleTimeString([], { hour: '2-digit'
 
 // ---------------------------------------------------------------- one case, from this hospital's side
 
-function CaseFile({ o, c, hospital, actor, notify }: { o: Offer; c: Case | undefined; hospital: Hospital; actor: Actor; notify: Notify }) {
+function CaseFile({ o, c, hospital, hospitals, actor, notify }: { o: Offer; c: Case | undefined; hospital: Hospital; hospitals: Hospital[]; actor: Actor; notify: Notify }) {
   const now = useNow()
   const evidence = useEvidence(c ? c.id : null, !!c)
   const destination = o.state === 'selected'
@@ -35,6 +36,7 @@ function CaseFile({ o, c, hospital, actor, notify }: { o: Offer; c: Case | undef
   const [canReceive, setCanReceive] = useState(false)
   const [reason, setReason] = useState<string>(DECLINE_REASONS[0])
   const [why, setWhy] = useState<string>(DECLINE_REASONS[0])
+  const [suggestId, setSuggestId] = useState('')
   const [busy, setBusy] = useState(false)
   const open = o.state === 'pending' && o.expiresAtMs > now
   const left = Math.max(0, Math.ceil((o.expiresAtMs - now) / 1000))
@@ -52,6 +54,7 @@ function CaseFile({ o, c, hospital, actor, notify }: { o: Offer; c: Case | undef
     )
   }
 
+  const suggestions = hospitals.filter((h) => h.id !== hospital.id && eligibility(c, [h]).eligible.length > 0)
   const allConfirmed = c.requiredCapabilities.every((cap) => ticks[cap]) && canReceive
   const eta = c.ambulancePos ? estimateMinutes(c.ambulancePos, hospital) : null
   const t = CASE_TYPES[c.type]
@@ -100,8 +103,14 @@ function CaseFile({ o, c, hospital, actor, notify }: { o: Offer; c: Case | undef
               <div className="row">
                 <button className="btn btn-go btn-lg" disabled={!allConfirmed || busy} onClick={() => act(() => respondToOffer(db, actor, o, { accept: true, canReceive, confirmations: Object.fromEntries(c.requiredCapabilities.map((cap) => [cap, !!ticks[cap]])), declineReason: null }), 'Accepted. Dispatch has your confirmation.')}><Icon name="check" /> Accept this patient</button>
                 <select value={reason} onChange={(e) => setReason(e.target.value)} aria-label="Reason for declining" style={{ maxWidth: 300 }}>{DECLINE_REASONS.map((r) => <option key={r}>{r}</option>)}</select>
-                <button className="btn btn-danger" disabled={busy} onClick={() => act(() => respondToOffer(db, actor, o, { accept: false, canReceive: false, confirmations: {}, declineReason: reason }), 'Declined. Dispatch will ask other hospitals.')}>Decline</button>
+                <button className="btn btn-danger" disabled={busy} onClick={() => act(() => respondToOffer(db, actor, o, { accept: false, canReceive: false, confirmations: {}, declineReason: reason, suggest: suggestions.find((h) => h.id === suggestId) ? { id: suggestId, name: suggestions.find((h) => h.id === suggestId)!.name } : null }), 'Declined. Dispatch will ask other hospitals.')}>Decline</button>
               </div>
+              {suggestions.length > 0 && (
+                <label className="field"><span className="field-label">If you decline: another hospital you think is better placed <small>(optional)</small></span>
+                  <select value={suggestId} onChange={(e) => setSuggestId(e.target.value)}><option value="">No suggestion</option>{suggestions.map((h) => <option key={h.id} value={h.id}>{h.name}</option>)}</select>
+                  <span className="hint">Only hospitals whose profile covers this patient&apos;s needs are listed. Dispatch decides whether to ask them, and they must still confirm.</span>
+                </label>
+              )}
             </Panel>
           ) : (
             <Notice tone={o.state === 'selected' ? 'go' : o.state === 'accepted' ? 'star' : 'wait'} title={o.state === 'selected' ? 'You are the confirmed destination' : o.state === 'accepted' ? 'You accepted. Waiting for dispatch to choose' : 'This request is no longer open for an answer'}>
@@ -168,7 +177,7 @@ function OurHospital({ hospital, actor, notify }: { hospital: Hospital; actor: A
 
 // ---------------------------------------------------------------- inbox
 
-export default function HospitalView({ profile, actor, hospital, cases, offers, notify, selected, onSelect }: Props) {
+export default function HospitalView({ profile, actor, hospital, cases, offers, hospitals, notify, selected, onSelect }: Props) {
   const [tab, setTab] = useState<'cases' | 'hospital'>('cases')
   const now = useNow()
   const byCase = useMemo(() => new Map(cases.map((c) => [c.id, c])), [cases])
@@ -217,7 +226,7 @@ export default function HospitalView({ profile, actor, hospital, cases, offers, 
               </>
             )}
           </aside>
-          <section aria-label="Case file">{current ? <CaseFile key={current.id} o={current} c={byCase.get(current.caseId)} hospital={hospital} actor={actor} notify={notify} /> : <Empty icon="hospital" title="Nothing to review">Select a request to see the case file.</Empty>}</section>
+          <section aria-label="Case file">{current ? <CaseFile key={current.id} o={current} c={byCase.get(current.caseId)} hospital={hospital} hospitals={hospitals} actor={actor} notify={notify} /> : <Empty icon="hospital" title="Nothing to review">Select a request to see the case file.</Empty>}</section>
         </div>
       )}
     </div>

@@ -170,15 +170,15 @@ try {
     await hosp.close()
   })
 
-  await step('an account with no staff role is told so and cannot see staff screens', async () => {
+  await step('an account with no staff role is a reporter account and cannot see staff screens', async () => {
     const r = await fetch('http://127.0.0.1:9199/identitytoolkit.googleapis.com/v1/accounts:signUp?key=fake', { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ email: 'norole@goldenhour.demo', password: PASSWORD, returnSecureToken: true }) })
     assert.equal(r.status, 200)
     const p = await open('norole', laptop)
     await login(p, 'norole@goldenhour.demo')
-    await p.getByText('You are signed in, but this account has no staff access').waitFor(T)
+    await p.getByText('Signed in as norole@goldenhour.demo').waitFor(T)
     assert.equal(await p.locator('.kpis').count(), 0)
     await p.goto(`${BASE}/#/history`)
-    await p.getByText('You are signed in, but this account has no staff access').waitFor(T)
+    await p.getByText('Signed in as norole@goldenhour.demo').waitFor(T)
     await p.close()
   })
 

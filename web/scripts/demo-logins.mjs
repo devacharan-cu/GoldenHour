@@ -11,7 +11,7 @@ let pw
 try { pw = JSON.parse(readFileSync(file, 'utf8')) } catch { console.error('No .secrets/accounts.json yet. Run: node scripts/provision.mjs --prod'); process.exit(1) }
 
 const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' })[c])
-const row = (a, note = '') => `<tr><td><b>${esc(a.displayName)}</b>${note ? `<br><small>${esc(note)}</small>` : ''}</td><td><code>${esc(a.email)}</code></td><td><button onclick="navigator.clipboard.writeText('${esc(a.email)}')">Copy email</button> <button onclick="navigator.clipboard.writeText('${esc(pw[a.email] ?? '')}')">Copy password</button></td></tr>`
+const row = (a, note = '') => `<tr><td><b>${esc(a.displayName)}</b>${note ? `<br><small>${esc(note)}</small>` : ''}</td><td><code>${esc(a.email)}</code></td><td><button onclick="navigator.clipboard.writeText('${esc(a.email)}')">Copy email</button> <button onclick="navigator.clipboard.writeText('${esc(pw[a.email] ?? '')}')">Copy password</button> <button onclick="var s=this.nextElementSibling;s.hidden=!s.hidden">Show</button><code hidden>${esc(pw[a.email] ?? '')}</code></td></tr>`
 const find = (role, id) => SEED_ACCOUNTS.find((a) => a.role === role && (a.hospitalId === id || a.ambulanceId === id))
 const antivenom = new Set(SEED_HOSPITALS.filter((h) => h.capabilities.includes('antivenom')).map((h) => h.id))
 const site = 'https://goldenhour-46131.web.app'

@@ -89,7 +89,7 @@ function Shell() {
         ? <ReportFlow notify={notify} onSent={(id) => { setSelected(id); go('/live') }} onCreated={() => undefined} />
         : <Dispatcher cases={cases.data} offers={offers.data} hospitals={hospitals.data} ambulances={ambulances.data} actor={actor} notify={notify} selected={selected} onSelect={setSelected} />
     } else if (profile.role === 'hospital') {
-      body = <HospitalView profile={profile} actor={actor} hospital={hospitals.data.find((h) => h.id === profile.hospitalId)} cases={cases.data} offers={offers.data} notify={notify} selected={selected} onSelect={setSelected} />
+      body = <HospitalView profile={profile} actor={actor} hospital={hospitals.data.find((h) => h.id === profile.hospitalId)} cases={cases.data} offers={offers.data} hospitals={hospitals.data} notify={notify} selected={selected} onSelect={setSelected} />
     } else {
       body = <Responder actor={actor} ambulance={ambulances.data.find((a) => a.id === profile.ambulanceId)} cases={cases.data} hospitals={hospitals.data} notify={notify} />
     }
@@ -103,7 +103,7 @@ function Shell() {
     else if (first === 'r' && seg[1]) body = <OpenByReceipt code={decodeURIComponent(path.slice(3))} notify={notify} onClose={() => go('/')} />
     else body = (
       <>
-        {roleState === 'norole' && <div style={{ marginBottom: 20 }}><Notice tone="wait" title="You are signed in, but this account has no staff access" actions={<button className="btn btn-sm" onClick={() => void logout()}>Sign out</button>}>It can report an emergency like a guest. Ask your administrator to assign a role if you should see dispatch, crew or hospital screens.</Notice></div>}
+        {roleState === 'norole' && <div style={{ marginBottom: 20 }}><Notice tone="go" title={`Signed in as ${user?.email ?? 'your account'}`} actions={<button className="btn btn-sm" onClick={() => void logout()}>Sign out</button>}>Your reports are saved to this account. Dispatch, crew and hospital screens are only for staff accounts assigned by an administrator.</Notice></div>}
         <Landing onReport={() => go('/report')} onOpenReceipt={(code) => go(`/r/${code}`)} hasOpenReports={cases.data.length > 0} onMine={() => go('/mine')} />
       </>
     )
@@ -131,7 +131,7 @@ function Shell() {
                 <>
                   <div className="scrim" onClick={() => setMenu(false)} />
                   <div className="menu" role="menu">
-                    <div className="menu-head"><b>{profile?.displayName ?? (roleState === 'guest' ? 'Guest' : user?.email)}</b><span className="fine">{profile ? ROLE_LABEL[profile.role] : roleState === 'guest' ? 'Not signed in with an account' : 'No staff access'}</span></div>
+                    <div className="menu-head"><b>{profile?.displayName ?? (roleState === 'guest' ? 'Guest' : user?.email)}</b><span className="fine">{profile ? ROLE_LABEL[profile.role] : roleState === 'guest' ? 'Not signed in with an account' : 'Reporter account'}</span></div>
                     <button role="menuitem" onClick={() => go('/account')}><Icon name="gear" size={18} /> Account and settings</button>
                     <button role="menuitem" onClick={() => void logout()}><Icon name="logout" size={18} /> {profile ? 'Sign out' : 'Leave and erase this device'}</button>
                   </div>

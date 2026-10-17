@@ -163,7 +163,7 @@ service cloud.firestore {
                 && !b.declinedAmbulanceIds.hasAny([a.ambulanceId]))
             || (b.status == 'dispatched' && a.status == 'reported' && released)
             || (a.status == 'closed' && a.closeReason is string && a.closeReason.size() >= 3 && near(a.closedAtMs)
-                && (b.status != 'arrived' || b.arrivalConfirmedAtMs != null)))
+                && (b.status != 'arrived' || b.arrivalConfirmedAtMs != null) && b.status != 'transporting'))
         && (a.status != 'dispatched' || b.status == 'dispatched' || b.status == 'reported')
         // the unit named on a live case cannot be swapped silently
         && (a.ambulanceId == b.ambulanceId || (b.status == 'reported' && a.status == 'dispatched') || (b.status == 'dispatched' && a.status == 'reported') || a.status == 'closed' && a.ambulanceId == b.ambulanceId)
@@ -181,6 +181,17 @@ service cloud.firestore {
                 && (a.selectedHospitalId == a.recommendedHospitalId || (a.overrideReason is string && a.overrideReason.size() >= 3))))
         && (a.destinationAckAtMs == b.destinationAckAtMs || a.destinationAckAtMs == null)
         && (a.destinationAckByUid == b.destinationAckByUid || a.destinationAckByUid == null);
+    }
+
+    // A reporter (or whoever holds the receipt) may withdraw a report only while it is still untouched: no crew has been offered the case.
+    // After dispatch the reporter must tell dispatch, so an ambulance is never recalled by an anonymous session.
+    function reporterWithdraw(caseId) {
+      let a = request.resource.data;
+      let b = resource.data;
+      return signedIn() && (b.reporterUid == uid() || isClaimant(caseId))
+        && b.status == 'reported' && a.status == 'closed'
+        && a.diff(b).affectedKeys().hasOnly(['status','closedAtMs','closeReason'])
+        && near(a.closedAtMs) && a.closeReason is string && a.closeReason.matches('Withdrawn by reporter: .{3,160}');
     }
 
     function crewCaseUpdate() {
@@ -229,7 +240,7 @@ service cloud.firestore {
     match /cases/{caseId} {
       allow get, list: if canReadCase(resource.data, caseId);
       allow create: if signedIn() && freshCase(request.resource.data);
-      allow update: if (isDispatcher() && dispatcherCaseUpdate(caseId)) || crewCaseUpdate() || hospitalCaseUpdate(caseId);
+      allow update: if (isDispatcher() && dispatcherCaseUpdate(caseId)) || crewCaseUpdate() || hospitalCaseUpdate(caseId) || reporterWithdraw(caseId);
       allow delete: if false;
 
       // Contact details and free text. Visible to the reporter (or whoever holds the receipt), dispatch, the assigned
@@ -274,7 +285,7 @@ service cloud.firestore {
             (isDispatcher() && request.resource.data.actorRole in ['dispatcher','system'])
             || (isAmbulance() && request.resource.data.actorRole == 'ambulance' && caseData(caseId).ambulanceId == prof().ambulanceId)
             || (isHospital() && request.resource.data.actorRole == 'hospital' && caseData(caseId).notifiedHospitalIds.hasAny([prof().hospitalId]))
-            || (!isStaff() && request.resource.data.actorRole == 'reporter' && request.resource.data.kind in ['reported','evidence']
+            || (!isStaff() && request.resource.data.actorRole == 'reporter' && request.resource.data.kind in ['reported','evidence','withdrawn']
                 && (getAfter(casePath(caseId)).data.reporterUid == uid() || isClaimant(caseId))));
         allow update, delete: if false;
       }
@@ -371,11 +382,15 @@ service cloud.firestore {
             && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['seenAtMs']) && near(request.resource.data.seenAtMs))
         // hospital answers, only before the deadline, only once, with explicit confirmations
         || (isHospital() && resource.data.hospitalId == prof().hospitalId && resource.data.state == 'pending' && nowMs() < resource.data.expiresAtMs
-            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['state','respondedAtMs','respondedByUid','confirmations','canReceive','declineReason'])
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['state','respondedAtMs','respondedByUid','confirmations','canReceive','declineReason','suggestedHospitalId'])
             && request.resource.data.state in ['accepted','declined'] && near(request.resource.data.respondedAtMs) && request.resource.data.respondedByUid == uid()
             && request.resource.data.confirmations is map && request.resource.data.confirmations.keys().hasOnly(['emergency','trauma','cardiac','stroke','antivenom','paediatrics','burns','icu','obstetric'])
             && request.resource.data.canReceive is bool
-            && (request.resource.data.declineReason == null || (request.resource.data.declineReason is string && request.resource.data.declineReason.size() <= 120)))
+            && (request.resource.data.declineReason == null || (request.resource.data.declineReason is string && request.resource.data.declineReason.size() <= 120))
+            // a decline may point at one other hospital (a suggestion only: it still has to be asked, accept and confirm)
+            && (!('suggestedHospitalId' in request.resource.data) || request.resource.data.suggestedHospitalId == null
+                || (request.resource.data.state == 'declined' && request.resource.data.suggestedHospitalId is string
+                    && request.resource.data.suggestedHospitalId.size() <= 40 && request.resource.data.suggestedHospitalId != resource.data.hospitalId)))
         // hospital withdraws a previous acceptance (e.g. resource ran out)
         || (isHospital() && resource.data.hospitalId == prof().hospitalId && resource.data.state in ['accepted','selected']
             && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['state','declineReason','respondedAtMs','respondedByUid'])

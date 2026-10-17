@@ -170,6 +170,24 @@ export async function contactNextWave(db: Firestore, actor: Actor, c: Case, cand
   })
 }
 
+/**
+ * Ask one specific hospital (for example the one a declining hospital suggested). It gets an ordinary pending offer, so it must still
+ * accept and confirm every capability before it can ever be chosen. Safe against two dispatchers: a hospital is only asked once.
+ */
+export async function askHospital(db: Firestore, actor: Actor, c: Case, cand: Candidate, why: string, now = Date.now(), ttlMs?: number): Promise<boolean> {
+  return runTransaction(db, async (tx) => {
+    const caseRef = doc(db, 'cases', c.id)
+    const cs = await tx.get(caseRef)
+    if (!cs.exists() || cs.data().status === 'closed' || cs.data().selectedHospitalId) return false
+    const known: string[] = cs.data().notifiedHospitalIds
+    if (known.includes(cand.hospital.id)) return false
+    tx.update(caseRef, { notifiedHospitalIds: [...known, cand.hospital.id], activeHospitalIds: [...cs.data().activeHospitalIds, cand.hospital.id] })
+    tx.set(doc(db, 'offers', offerId(c.id, cand.hospital.id)), offerDoc(c, cand, cs.data().offerWave, now, ttlMs))
+    tx.set(doc(collection(db, 'cases', c.id, 'events')), { kind: 'wave', text: `Asked ${cand.hospital.name} (${why})`, atMs: now, actorUid: actor.uid, actorRole: 'system' })
+    return true
+  })
+}
+
 export async function extendDeadline(db: Firestore, _actor: Actor, o: Offer, extraMs = 60_000, now = Date.now()): Promise<void> {
   await updateDoc(doc(db, 'offers', o.id), { expiresAtMs: Math.max(o.expiresAtMs, now) + extraMs })
 }
@@ -257,6 +275,8 @@ export interface OfferResponse {
   canReceive: boolean
   confirmations: Partial<Record<Capability, boolean>>
   declineReason: string | null
+  /** Declining only: another hospital the team thinks is better placed. */
+  suggest?: { id: string; name: string } | null
 }
 
 export async function respondToOffer(db: Firestore, actor: Actor, o: Offer, r: OfferResponse, now = Date.now()): Promise<void> {
@@ -264,11 +284,12 @@ export async function respondToOffer(db: Firestore, actor: Actor, o: Offer, r: O
   b.update(doc(db, 'offers', o.id), {
     state: r.accept ? 'accepted' : 'declined', respondedAtMs: now, respondedByUid: actor.uid,
     confirmations: r.confirmations, canReceive: r.accept ? r.canReceive : false, declineReason: r.accept ? null : (r.declineReason ?? 'Declined'),
+    ...(!r.accept && r.suggest ? { suggestedHospitalId: r.suggest.id } : {}),
   })
   // Declining ends this hospital's access to the case and its evidence, in the same atomic write.
   if (!r.accept) b.update(doc(db, 'cases', o.caseId), { activeHospitalIds: arrayRemove(o.hospitalId) })
   addEvent(db, b, o.caseId, actor, null, r.accept ? 'offer_accepted' : 'offer_declined',
-    r.accept ? `${o.hospitalName} accepted${r.canReceive ? '' : ' (cannot receive)'}; confirmed: ${Object.entries(r.confirmations).filter(([, v]) => v).map(([k]) => k).join(', ') || 'nothing'}` : `${o.hospitalName} declined: ${r.declineReason ?? 'no reason given'}`, now)
+    r.accept ? `${o.hospitalName} accepted${r.canReceive ? '' : ' (cannot receive)'}; confirmed: ${Object.entries(r.confirmations).filter(([, v]) => v).map(([k]) => k).join(', ') || 'nothing'}` : `${o.hospitalName} declined: ${r.declineReason ?? 'no reason given'}${r.suggest ? `. Suggested ${r.suggest.name} instead` : ''}`, now)
   await b.commit()
 }
 
@@ -329,7 +350,43 @@ export async function closeCase(db: Firestore, actor: Actor, c: Case, reason: st
   await b.commit()
 }
 
+export type CancelKind = 'false' | 'accidental' | 'cancelled'
+const CANCEL_PREFIX: Record<CancelKind, string> = { false: 'False report', accidental: 'Accidental report', cancelled: 'Cancelled' }
+
+/** States in which dispatch may still end a case without a hospital hand-over. After pickup the patient is in the vehicle, so only the hand-over closes it. */
+export const canCancelStatus = (status: Case['status']) => status === 'reported' || status === 'dispatched' || status === 'enroute' || status === 'onscene'
+
+/**
+ * Dispatch ends a case that will not reach a hospital: a false or accidental report, or a cancellation. Nothing is deleted. The case stays
+ * in history with its reason; the ambulance is released and every hospital is stood down; the audit trail records who did it and why.
+ */
+export async function cancelCase(db: Firestore, actor: Actor, c: Case, kind: CancelKind, note: string, offers: Offer[] = [], now = Date.now()): Promise<void> {
+  const why = note.trim()
+  if (why.length < 3) throw new Error('Write a short reason (at least 3 characters). It is kept in the audit trail.')
+  if (!canCancelStatus(c.status)) throw new Error(c.status === 'closed' ? 'This case is already closed.' : 'The patient is already being transported or has arrived. Finish the hand-over instead of cancelling.')
+  const b = writeBatch(db)
+  b.update(doc(db, 'cases', c.id), {
+    status: 'closed', closedAtMs: now, closeReason: `${CANCEL_PREFIX[kind]}: ${why}`.slice(0, 200),
+    activeHospitalIds: [], selectedHospitalId: null, selectedHospitalName: null,
+  })
+  for (const o of offers.filter((x) => x.caseId === c.id && ['pending', 'accepted', 'selected'].includes(x.state))) b.update(doc(db, 'offers', o.id), { state: 'withdrawn' })
+  if (c.ambulanceId) b.update(doc(db, 'ambulances', c.ambulanceId), { available: true, currentCaseId: null })
+  addEvent(db, b, c.id, actor, null, 'cancelled', `Case ended as ${CANCEL_PREFIX[kind].toLowerCase()}: ${why}`, now)
+  await b.commit()
+}
+
+/** The reporter takes their own report back. Only possible before any crew has been offered the case. */
+export async function withdrawReport(db: Firestore, actor: Actor, c: Case, note: string, now = Date.now()): Promise<void> {
+  const why = note.trim() || 'No longer needed'
+  if (c.status !== 'reported') throw new Error('A crew has already been contacted about this report. Call 112 or the dispatcher to change it.')
+  const b = writeBatch(db)
+  b.update(doc(db, 'cases', c.id), { status: 'closed', closedAtMs: now, closeReason: `Withdrawn by reporter: ${why}`.slice(0, 200) })
+  addEvent(db, b, c.id, actor, null, 'withdrawn', `Reporter withdrew the report: ${why}`, now)
+  await b.commit()
+}
+
 export async function markDuplicate(db: Firestore, actor: Actor, c: Case, ofCase: Case, now = Date.now()): Promise<void> {
+  if (!canCancelStatus(c.status)) throw new Error('The patient is already on board or the case is closed, so it cannot be merged.')
   const b = writeBatch(db)
   b.update(doc(db, 'cases', c.id), { duplicateOf: ofCase.id, status: 'closed', closedAtMs: now, closeReason: 'Duplicate report' })
   if (c.ambulanceId) b.update(doc(db, 'ambulances', c.ambulanceId), { available: true, currentCaseId: null })

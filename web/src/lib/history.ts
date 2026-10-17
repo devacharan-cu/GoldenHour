@@ -1,5 +1,5 @@
 import { CASE_TYPES } from './capabilities'
-import type { Case } from './types'
+import { closeKindOf, type Case } from './types'
 
 const STATUS_FILTER: Record<string, (c: Case) => boolean> = {
   all: () => true,
@@ -7,6 +7,10 @@ const STATUS_FILTER: Record<string, (c: Case) => boolean> = {
   closed: (c) => c.status === 'closed',
   completed: (c) => c.status === 'closed' && !!c.arrivalConfirmedAtMs,
   cancelled: (c) => c.status === 'closed' && !c.arrivalConfirmedAtMs,
+  false: (c) => closeKindOf(c) === 'false',
+  accidental: (c) => closeKindOf(c) === 'accidental',
+  duplicate: (c) => closeKindOf(c) === 'duplicate',
+  withdrawn: (c) => closeKindOf(c) === 'withdrawn',
 }
 
 export const searchText = (c: Case) => [c.id, c.brief, CASE_TYPES[c.type].label, c.selectedHospitalName, c.ambulanceCallSign, c.closeReason, c.status].filter(Boolean).join(' ').toLowerCase()

@@ -141,6 +141,8 @@ export interface Offer {
   confirmations: Partial<Record<Capability, boolean>> | null
   canReceive: boolean | null
   declineReason: string | null
+  /** A declining hospital may point dispatch at another hospital. It is only a suggestion: that hospital must still be asked, accept and confirm. */
+  suggestedHospitalId?: string | null
   distanceKm: number
   etaMin: number
   etaSource: 'road' | 'estimate'
@@ -195,7 +197,7 @@ export interface AiBriefing {
 export type EventKind =
   | 'reported' | 'dispatched' | 'ack' | 'crew_declined' | 'assignment_cancelled' | 'destination_ack' | 'pickup' | 'evidence' | 'ai' | 'offer_sent' | 'offer_seen' | 'offer_accepted' | 'offer_declined'
   | 'offer_timeout' | 'offer_revoked' | 'wave' | 'recommended' | 'selected' | 'override' | 'escalation' | 'status'
-  | 'arrival_confirmed' | 'duplicate' | 'closed'
+  | 'arrival_confirmed' | 'duplicate' | 'closed' | 'cancelled' | 'withdrawn'
 
 /** cases/{id}/events/{eventId}: append-only audit trail. */
 export interface CaseEvent {
@@ -221,4 +223,18 @@ export function normalizeCase(raw: Partial<Case> & { id: string }): Case {
     patients: 1, locationSource: 'manual',
     ...raw,
   } as Case
+}
+
+/** How a case ended, read from its recorded close reason (older cases only have free text). */
+export type CloseKind = 'completed' | 'false' | 'accidental' | 'duplicate' | 'withdrawn' | 'cancelled'
+export const CLOSE_LABEL: Record<CloseKind, string> = { completed: 'Completed', false: 'False report', accidental: 'Accidental report', duplicate: 'Duplicate', withdrawn: 'Withdrawn by reporter', cancelled: 'Cancelled' }
+export function closeKindOf(c: Pick<Case, 'status' | 'closeReason' | 'duplicateOf'>): CloseKind | null {
+  if (c.status !== 'closed') return null
+  const r = c.closeReason ?? ''
+  if (c.duplicateOf || /^duplicate/i.test(r)) return 'duplicate'
+  if (/^false report/i.test(r)) return 'false'
+  if (/^accidental report/i.test(r)) return 'accidental'
+  if (/^withdrawn by reporter/i.test(r)) return 'withdrawn'
+  if (/^cancelled/i.test(r)) return 'cancelled'
+  return 'completed'
 }

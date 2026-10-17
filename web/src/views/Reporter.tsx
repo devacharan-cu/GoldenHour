@@ -11,8 +11,8 @@ import { db } from '../lib/firebase'
 import { uploadQueue, useUploadQueue } from '../lib/queue'
 import { receiptFor, receiptLink, saveReceipt } from '../lib/receipts'
 import { useCaseById, useEvidence, useNow, useOnline } from '../lib/store'
-import type { Case, CaseType, LatLng, Severity } from '../lib/types'
-import { claimCase, createCaseQueued } from '../lib/workflow'
+import { CLOSE_LABEL, closeKindOf, type Case, type CaseType, type LatLng, type Severity } from '../lib/types'
+import { claimCase, createCaseQueued, withdrawReport } from '../lib/workflow'
 
 const PRESETS: { label: string; pos: LatLng }[] = [
   { label: 'Hampankatta junction', pos: { lat: 12.8704, lng: 74.8419 } },
@@ -61,6 +61,36 @@ const updates = (c: Case) => [
   [c.closedAtMs, c.closeReason ? `Case closed: ${c.closeReason}` : null],
 ].filter((x): x is [number, string] => !!x[0] && !!x[1]).sort((a, b) => b[0] - a[0])
 
+
+/** Take a report back. Only offered while no crew has been asked: after that, the dispatcher decides. */
+function WithdrawPanel({ c, notify }: { c: Case; notify: Notify }) {
+  const { actor } = useAuth()
+  const [open, setOpen] = useState(false)
+  const [why, setWhy] = useState('Sent by mistake')
+  const [sure, setSure] = useState(false)
+  const [busy, setBusy] = useState(false)
+  if (c.status === 'closed') {
+    const kind = closeKindOf(c)
+    return <Notice tone={kind === 'completed' ? 'go' : 'wait'} title={`This report is closed: ${kind ? CLOSE_LABEL[kind].toLowerCase() : 'closed'}`}>{c.closeReason ? c.closeReason : 'No further action is needed.'} The record is kept so the case can be reviewed.</Notice>
+  }
+  if (c.status !== 'reported') return <p className="fine">A crew has already been contacted. To change or cancel this report, call 112 or ask the dispatcher.</p>
+  if (!open) return <button className="btn btn-sm btn-danger" style={{ justifySelf: 'start' }} onClick={() => setOpen(true)}>Sent by mistake? Withdraw this report</button>
+  async function go() {
+    if (!actor) return
+    setBusy(true)
+    try { await withdrawReport(db, actor, c, why); notify('Your report was withdrawn. It stays on record.', 'good') }
+    catch (e) { const code = (e as { code?: string }).code; notify(code === 'permission-denied' ? 'A crew was just contacted, so this report can no longer be withdrawn here. Call 112 or the dispatcher.' : (e as Error).message, 'warn'); setBusy(false) }
+  }
+  return (
+    <Panel title="Withdraw this report" quiet>
+      <p className="sub measure">Only do this if nobody needs help. If someone is hurt, keep the report open and call 112. Dispatch keeps a record that you withdrew it.</p>
+      <label className="field"><span className="field-label">Reason</span><select value={why} onChange={(e) => setWhy(e.target.value)}>{['Sent by mistake', 'It was a test', 'No longer needed', 'Reported twice'].map((r) => <option key={r}>{r}</option>)}</select></label>
+      <label className="choice"><input type="checkbox" checked={sure} onChange={(e) => setSure(e.target.checked)} /><span>Nobody needs an ambulance for this report.</span></label>
+      <div className="row"><button className="btn btn-danger" disabled={!sure || busy} onClick={() => void go()}>{busy ? <><span className="spin" /> Withdrawing</> : 'Withdraw the report'}</button><button className="btn" onClick={() => setOpen(false)}>Keep it open</button></div>
+    </Panel>
+  )
+}
+
 export function ReportTracking({ c, notify, onBack }: { c: Case; notify: Notify; onBack?: () => void }) {
   const { user } = useAuth()
   const evidence = useEvidence(c.id)
@@ -87,6 +117,7 @@ export function ReportTracking({ c, notify, onBack }: { c: Case; notify: Notify;
             </div>
             <p className="sub">Stay with the patient and keep your phone free. If anything changes, or it gets worse, call 112.</p>
           </Panel>
+          <WithdrawPanel c={c} notify={notify} />
           {(queue.length > 0 || evidence.data.length > 0 || c.evidenceExpected > 0) && (
             <Panel title="Your files">
               {queue.length > 0 && <UploadList items={queue} onRetry={(id) => void uploadQueue.retry(id)} onRemove={(id) => void uploadQueue.remove(id)} />}

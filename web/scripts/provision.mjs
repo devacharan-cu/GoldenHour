@@ -69,7 +69,10 @@ if (prod) {
   mkdirSync(secretsDir, { recursive: true })
   if (existsSync(secretsFile)) saved = JSON.parse(readFileSync(secretsFile, 'utf8'))
 }
-const newPassword = () => `${randomBytes(9).toString('base64url')}-${randomBytes(3).toString('hex')}`
+const WORDS = ['maple', 'river', 'tiger', 'cedar', 'lotus', 'amber', 'coral', 'delta', 'ember', 'falcon', 'harbor', 'island', 'jasmine', 'koala', 'lemon', 'mango', 'nectar', 'orchid', 'pepper', 'quartz', 'robin', 'sunset', 'tulip', 'violet']
+const pick = () => WORDS[randomBytes(1)[0] % WORDS.length]
+const easyPassword = `${pick()}${pick()}${String(randomBytes(2).readUInt16BE() % 90 + 10)}`
+const newPassword = () => (args.has('--easy') ? easyPassword : `${randomBytes(9).toString('base64url')}-${randomBytes(3).toString('hex')}`)
 
 // Hospitals and fleet (demo data). In production, hospitals that already have availability data are kept unless --reseed.
 for (const { id, beds, icu, resources, ...h } of SEED_HOSPITALS) {
@@ -90,7 +93,7 @@ for (const acct of SEED_ACCOUNTS) {
   if (!user) {
     password = prod ? newPassword() : 'Demo-pass-123!'
     user = await backend.createUser(acct.email, password, acct.displayName)
-  } else if (args.has('--reset-passwords') || (prod && !password)) {
+  } else if (args.has('--reset-passwords') || args.has('--easy') || (prod && !password)) {
     password = prod ? newPassword() : 'Demo-pass-123!'
     await backend.setPassword(user.uid, password)
   }

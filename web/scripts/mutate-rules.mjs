@@ -36,6 +36,10 @@ const mutants = [
   ['reporters can pre-set workflow fields on create', "&& d.ambulanceId == null && d.ambulanceCallSign == null", "&& true && d.ambulanceCallSign == null"],
   ['any hospital may edit another hospital', "allow update: if isHospital() && prof().hospitalId == hospitalId", "allow update: if isHospital()"],
   ['anyone may write anyone else\'s display preferences', "allow create, update: if signedIn() && userId == uid()\n        && request.resource.data.keys().hasOnly(['theme'", "allow create, update: if signedIn()\n        && request.resource.data.keys().hasOnly(['theme'"],
+  ['a reporter can withdraw after a crew was contacted', "&& b.status == 'reported' && a.status == 'closed'\n        && a.diff(b)", "&& a.status == 'closed'\n        && a.diff(b)"],
+  ['a reporter withdrawal can change other fields', "&& a.diff(b).affectedKeys().hasOnly(['status','closedAtMs','closeReason'])", "&& true"],
+  ['dispatch can cancel a patient who is already on board', "(b.status != 'arrived' || b.arrivalConfirmedAtMs != null) && b.status != 'transporting'))", "(b.status != 'arrived' || b.arrivalConfirmedAtMs != null)))"],
+  ['a hospital suggestion can accompany an accept', "|| (request.resource.data.state == 'declined' && request.resource.data.suggestedHospitalId is string", "|| (request.resource.data.suggestedHospitalId is string"],
 ]
 
 const dir = mkdtempSync(join(tmpdir(), 'gh-rules-'))

@@ -1,4 +1,5 @@
 import { useEffect, useState } from 'react'
+import { CreateAccountForm, GoogleButton } from '../components/AccountForms'
 import { Icon, Notice, Panel, Pill, Switch, useInstall, type Notify } from '../components/ui'
 import { askNotificationPermission, chime, notificationState } from '../lib/alerts'
 import { friendlyAuthError, useAuth } from '../lib/auth'
@@ -61,7 +62,7 @@ export default function Account({ hospitals, ambulances, notify }: { hospitals: 
       <Panel title="Profile">
         <div className="profile-head">
           <div className="profile-badge" aria-hidden>{initials}</div>
-          <div className="stack-sm"><p className="h">{name}</p><div className="row row-tight">{staff ? <Pill tone="star">{ROLE_NAME[profile!.role]}</Pill> : <Pill>{roleState === 'guest' ? 'Guest session' : 'No staff access'}</Pill>}{linked && <Pill>{linked}</Pill>}</div></div>
+          <div className="stack-sm"><p className="h">{name}</p><div className="row row-tight">{staff ? <Pill tone="star">{ROLE_NAME[profile!.role]}</Pill> : <Pill>{roleState === 'guest' ? 'Guest session' : 'Reporter account'}</Pill>}{linked && <Pill>{linked}</Pill>}</div></div>
         </div>
         <dl className="facts">
           <div><dt>Sign-in</dt><dd>{account?.provider === 'password' ? 'Email and password' : account?.provider === 'anonymous' ? 'Guest, no account' : 'Not signed in'}</dd></div>
@@ -71,9 +72,18 @@ export default function Account({ hospitals, ambulances, notify }: { hospitals: 
           {user && <div><dt>Account ID</dt><dd className="num">{user.uid.slice(0, 8)}</dd></div>}
           <div><dt>Session</dt><dd>Restored automatically on this device until you sign out</dd></div>
         </dl>
-        {roleState === 'norole' && <Notice tone="wait" title="This account has no staff access">It can report an emergency like a guest, but cannot see dispatch, crew or hospital screens. Ask your administrator to assign a role.</Notice>}
+        {roleState === 'norole' && <Notice tone="go" title="Reporter account">Your reports are saved to this account and open on any device you sign in on. Dispatch, crew and hospital screens need a staff role, which only an administrator can assign.</Notice>}
         {staff && <p className="fine">Your role, hospital and unit are set by an administrator. They cannot be changed from here, which is what keeps one role from acting as another.</p>}
       </Panel>
+
+      {roleState === 'guest' && (
+        <Panel title="Create an account">
+          <p className="sub measure">Guest reporting keeps working without one. An account keeps your reports on every device you sign in on, instead of only this browser. Everything you have reported so far moves into it.</p>
+          <GoogleButton label="Continue with Google" />
+          <div className="divider"><span>or use an email</span></div>
+          <CreateAccountForm guest onDone={() => notify('Account created. Your reports are now saved to it.', 'good')} />
+        </Panel>
+      )}
 
       <Panel title="Appearance">
         <div className="settings-row"><span className="field-label">Colour theme</span>
