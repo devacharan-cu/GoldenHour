@@ -142,9 +142,9 @@ export function parseBriefing(raw: string, ctx: { model: string; evidenceIds: st
     transcript: str(o.transcript, 6000),
     summary: applyGuardrails(summary, flags),
     facts,
-    missingInformation: strList(o.missingInformation),
-    uncertainties: strList(o.uncertainties),
-    conflicts: strList(o.conflicts),
+    missingInformation: strList(o.missingInformation).map((x) => applyGuardrails(x, flags)),
+    uncertainties: strList(o.uncertainties).map((x) => applyGuardrails(x, flags)),
+    conflicts: strList(o.conflicts).map((x) => applyGuardrails(x, flags)),
     handoff: applyGuardrails(handoff, flags),
     sourceEvidenceIds: ctx.evidenceIds,
     guardrailFlags: [...flags],
@@ -211,10 +211,24 @@ export async function createFirebaseAiClient(app: import('firebase/app').Firebas
     async generate(system, prompt, files) {
       const model = getGenerativeModel(ai, { model: AI_MODEL, systemInstruction: system, generationConfig: { responseMimeType: 'application/json', responseSchema: schema, temperature: 0.1 } })
       const parts = files.map((f) => ({ inlineData: { mimeType: f.mime, data: toBase64(f.data) } }))
-      const res = await model.generateContent([...parts, { text: prompt }] as unknown as Parameters<typeof model.generateContent>[0])
-      return res.response.text()
+      // The no-cost tier sometimes answers 429 (rate limit) or 503 (overloaded) for a moment: retry twice, with a short pause, before giving up.
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const res = await model.generateContent([...parts, { text: prompt }] as unknown as Parameters<typeof model.generateContent>[0])
+          return res.response.text()
+        } catch (e) {
+          if (attempt >= 2 || !isTransientAiError(e)) throw e
+          await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)))
+        }
+      }
     },
   }
+}
+
+/** Worth retrying: rate limits, overload and brief outages. A refusal, a bad request or a permission problem is not. */
+export function isTransientAiError(e: unknown): boolean {
+  const m = String((e as { message?: string } | null)?.message ?? e ?? '')
+  return /(429|500|502|503|504)|overloaded|unavailable|try again|rate.?limit|quota|deadline|timed? ?out|fetch failed|network/i.test(m) && !/(400|401|403|404)|api key|permission|not found/i.test(m)
 }
 
 function toBase64(bytes: Uint8Array): string {

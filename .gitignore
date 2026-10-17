@@ -11,3 +11,4 @@ firebase-debug.log
 ui-debug.log
 web/test-results/
 web/devices-run.log
+web/e2e-run.log

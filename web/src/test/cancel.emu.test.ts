@@ -115,3 +115,21 @@ describe('a declining hospital may suggest another, which still has to confirm',
     await expect(updateDoc(doc(h.db, 'offers', offer.id), { ...base, state: 'accepted', canReceive: true, declineReason: null, suggestedHospitalId: 'h5' })).rejects.toThrow()
   })
 })
+
+describe('opening a receipt more than once', () => {
+  it('lets the same session open the same receipt again, and two tabs at once, but never with a wrong secret', async () => {
+    const r = reporter('rep1')
+    const made = await createCaseQueued(r.db, r.actor, input('trauma'))
+    await made.done
+    const { caseId, secret } = parseReceipt(made.receipt)!
+    const phone = reporter('second-device')
+    await claimCase(phone.db, phone.actor, caseId, secret)
+    await claimCase(phone.db, phone.actor, caseId, secret) // again: no "wrong code" error
+    const tabs = reporter('third-device')
+    await Promise.all([claimCase(tabs.db, tabs.actor, caseId, secret), claimCase(tabs.db, tabs.actor, caseId, secret)])
+    expect((await readCase(phone.db, caseId)).id).toBe(caseId)
+    const thief = reporter('thief')
+    await expect(claimCase(thief.db, thief.actor, caseId, 'x'.repeat(32))).rejects.toThrow()
+    await expect(claimCase(thief.db, thief.actor, caseId, 'x'.repeat(32))).rejects.toThrow() // still refused the second time
+  })
+})

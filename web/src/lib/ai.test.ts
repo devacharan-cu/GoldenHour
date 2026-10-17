@@ -126,3 +126,12 @@ describe('settings sanitising', () => {
     expect(sanitizeSettings({ theme: 'dark', textSize: 'large', reduceMotion: 'on', sound: false, desktopAlerts: true, compact: true })).toEqual({ theme: 'dark', textSize: 'large', reduceMotion: 'on', sound: false, desktopAlerts: true, compact: true })
   })
 })
+
+describe('which AI failures are retried', () => {
+  it('retries rate limits and overload, not refusals or permission problems', async () => {
+    const { isTransientAiError } = await import('./ai')
+    for (const m of ['[429 Too Many Requests] quota exceeded', '[503 Service Unavailable] The model is overloaded', 'fetch failed', 'Request timed out']) expect(isTransientAiError(new Error(m)), m).toBe(true)
+    for (const m of ['[403 Forbidden] App Check token invalid', '[400 Bad Request] API key not valid', '[404] model not found', 'The response was blocked']) expect(isTransientAiError(new Error(m)), m).toBe(false)
+    expect(isTransientAiError(null)).toBe(false)
+  })
+})

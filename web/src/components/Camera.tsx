@@ -75,7 +75,7 @@ export function CameraCapture({ mode, onDone, onClose, onFallback }: {
         if (cancelled) { stream.getTracks().forEach((t) => t.stop()); return }
         streamRef.current = stream
         const v = videoRef.current
-        if (v) { v.srcObject = stream; await v.play().catch(() => undefined) }
+        if (v) { v.srcObject = stream; void v.play().catch(() => undefined) } // do not wait on play(): some browsers only resolve it once the first frame arrives
         const devices = await navigator.mediaDevices.enumerateDevices().catch(() => [])
         if (!cancelled) { setCanFlip(devices.filter((d) => d.kind === 'videoinput').length > 1); setLive(true) }
       } catch (e) {
@@ -104,7 +104,8 @@ export function CameraCapture({ mode, onDone, onClose, onFallback }: {
 
   function shoot() {
     const v = videoRef.current
-    if (!v || !v.videoWidth) return
+    if (!v) return
+    if (!v.videoWidth) { setProblem({ kind: 'other', text: 'The camera is still warming up. Wait a second and tap the shutter again.' }); return }
     const scale = Math.min(1, 1920 / Math.max(v.videoWidth, v.videoHeight))
     const canvas = document.createElement('canvas')
     canvas.width = Math.round(v.videoWidth * scale)

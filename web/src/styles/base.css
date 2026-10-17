@@ -24,3 +24,7 @@ img, video, audio, canvas { max-width: 100%; display: block; }
 .fine { color: var(--ink-3); font-size: 0.8rem; line-height: 1.4; }
 .strong { font-weight: 700; }
 .measure { max-width: 62ch; }
+
+/* Anything a person types (summaries, names, notes, file names) may be one very long word: let it wrap anywhere instead of widening the page. */
+body { overflow-wrap: anywhere; }
+.strip, .strip-body, .rows-row, .tile-body, .facts dd, .panel-body { min-width: 0; }

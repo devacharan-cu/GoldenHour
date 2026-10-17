@@ -229,8 +229,10 @@ export function ReportFlow({ notify, onSent, onCreated }: { notify: Notify; onSe
     )
   }
 
+  const sending = useRef(false) // synchronous guard: two taps in the same instant must not make two reports (state alone updates too late)
   async function submit() {
-    if (!pos) return
+    if (!pos || sending.current) return
+    sending.current = true
     setBusy(true)
     setError(null)
     try {
@@ -247,6 +249,7 @@ export function ReportFlow({ notify, onSent, onCreated }: { notify: Notify; onSe
       if (onSent) onSent(made.id)
       onCreated(made)
     } catch (e) {
+      sending.current = false // only a failed send may be tried again; after success this form is finished, so a second tap can never make a second report
       setError(`Could not send the report: ${(e as Error | null)?.message ?? 'unknown error'}`)
     } finally { setBusy(false) }
   }

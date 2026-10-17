@@ -1,4 +1,4 @@
-import { arrayRemove, collection, doc, runTransaction, setDoc, updateDoc, writeBatch, type Firestore, type WriteBatch } from 'firebase/firestore'
+import { arrayRemove, collection, doc, getDoc, runTransaction, setDoc, updateDoc, writeBatch, type Firestore, type WriteBatch } from 'firebase/firestore'
 import { requiredCapabilities } from './capabilities'
 import { formatReceipt, randomSecret, sha256Hex } from './crypto'
 import { OFFER_TTL_MS, type Candidate, type PlanAction } from './matching'
@@ -67,7 +67,14 @@ export async function createCaseQueued(db: Firestore, actor: Actor, i: NewCaseIn
 
 /** Open a case on another device by proving possession of its receipt code. */
 export async function claimCase(db: Firestore, actor: Actor, caseId: string, secret: string, now = Date.now()): Promise<void> {
-  await setDoc(doc(db, 'cases', caseId, 'claims', actor.uid), { secret, claimedAtMs: now })
+  const ref = doc(db, 'cases', caseId, 'claims', actor.uid)
+  // A claim is create-only. Opening the same receipt again (or two tabs at once) must succeed, not fail as "wrong code".
+  const claimed = async () => { try { return (await getDoc(ref)).exists() } catch { return false } }
+  if (await claimed()) return
+  try { await setDoc(ref, { secret, claimedAtMs: now }) } catch (e) {
+    if ((e as { code?: string }).code === 'permission-denied' && (await claimed())) return
+    throw e
+  }
 }
 
 // ---------------------------------------------------------------- dispatch: offer the case to a crew
