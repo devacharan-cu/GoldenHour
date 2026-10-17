@@ -1,7 +1,10 @@
 import react from '@vitejs/plugin-react'
-import { defineConfig } from 'vite'
+import { defineConfig } from 'vitest/config'
 
-// https://vite.dev/config/
 export default defineConfig({
   plugins: [react()],
+  test: {
+    // Emulator and browser suites run through their own scripts (npm run test:emu / test:e2e).
+    exclude: ['**/node_modules/**', '**/*.emu.test.ts', 'e2e/**'],
+  },
 })

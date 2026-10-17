@@ -1,26 +1,232 @@
 rules_version = '2';
-// DEMO RULES: the app has no user accounts yet, so reads are public and writes are limited to
-// the three app collections with shape checks and no deletes. Add Firebase Auth + roles before real use.
+
+// GoldenHour security rules. These ARE the trust boundary (there is no backend on the Spark plan).
+//
+// Roles live in users/{uid}, which no client can write. Accounts and role documents are created only by
+// scripts/provision.mjs running with project-owner credentials. Reporters need no role: any signed-in
+// user (including anonymous) may report an emergency and read only their own case.
+//
+// DEMONSTRATION SYSTEM: rules reduce risk but have limits (see README "Security model and limitations").
+
 service cloud.firestore {
   match /databases/{database}/documents {
-    match /incidents/{id} {
-      allow read: if true;
-      allow create: if request.resource.data.keys().hasAll(['type','severity','lat','lng','status','createdAtMs'])
-                    && request.resource.data.severity in [1,2,3]
-                    && request.resource.data.lat is number && request.resource.data.lng is number
-                    && request.resource.data.note is string && request.resource.data.note.size() <= 500
-                    && request.resource.data.contact is string && request.resource.data.contact.size() <= 40;
-      allow update: if true;
-      allow delete: if false;
+
+    // ---------- identity helpers ----------
+    function signedIn() { return request.auth != null; }
+    function uid() { return request.auth.uid; }
+    function profilePath() { return /databases/$(database)/documents/users/$(request.auth.uid); }
+    function hasActiveProfile() { return signedIn() && exists(profilePath()) && get(profilePath()).data.active == true; }
+    function prof() { return get(profilePath()).data; }
+    function isDispatcher() { return hasActiveProfile() && prof().role == 'dispatcher'; }
+    function isHospital() { return hasActiveProfile() && prof().role == 'hospital'; }
+    function isAmbulance() { return hasActiveProfile() && prof().role == 'ambulance'; }
+    function isStaff() { return isDispatcher() || isHospital() || isAmbulance(); }
+    function actorRole() { return isDispatcher() ? 'dispatcher' : isHospital() ? 'hospital' : isAmbulance() ? 'ambulance' : 'reporter'; }
+    function casePath(caseId) { return /databases/$(database)/documents/cases/$(caseId); }
+    function nowMs() { return request.time.toMillis(); }
+    function near(ms) { return ms is number && ms > nowMs() - 300000 && ms < nowMs() + 300000; }
+    function validPos(p) {
+      return p == null || (p.keys().hasOnly(['lat','lng','atMs','source']) && p.lat is number && p.lat >= -90 && p.lat <= 90
+        && p.lng is number && p.lng >= -180 && p.lng <= 180 && near(p.atMs) && p.source in ['gps','simulated']);
     }
-    match /hospitals/{id} {
-      allow read: if true;
-      allow create, update: if request.resource.data.name is string && request.resource.data.emergencyBeds is int;
-      allow delete: if false;
+
+    // ---------- capabilities and qualification ----------
+    function capList(l) {
+      return l is list && l.size() <= 9 && l.hasOnly(['emergency','trauma','cardiac','stroke','antivenom','paediatrics','burns','icu','obstetric']);
     }
-    match /ambulances/{id} {
-      allow read: if true;
-      allow create, update: if request.resource.data.callSign is string;
+    // A hospital is "qualified" only if it accepted, said it can receive, and confirmed EVERY required capability.
+    function qualified(o, caps) {
+      return o.state == 'accepted' && o.canReceive == true && o.confirmations.get(caps[0], false) == true
+        && (caps.size() < 2 || o.confirmations.get(caps[1], false) == true);
+    }
+    function offerPath(caseId, hospitalId) { return /databases/$(database)/documents/offers/$(caseId + '_' + hospitalId); }
+
+    // ---------- users ----------
+    match /users/{userId} {
+      allow read: if signedIn() && userId == uid();
+      allow write: if false;
+    }
+
+    // ---------- hospitals ----------
+    match /hospitals/{hospitalId} {
+      allow read: if isStaff();
+      allow create, delete: if false;
+      // A hospital's own staff maintain its permanent capability profile and live availability.
+      allow update: if isHospital() && prof().hospitalId == hospitalId
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['capabilities','capabilitiesUpdatedAtMs','availability','diverted','divertedCapabilities'])
+        && capList(request.resource.data.capabilities) && capList(request.resource.data.divertedCapabilities)
+        && request.resource.data.diverted is bool
+        // profile edits must stamp the time; availability edits must stamp time and author
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['capabilities','diverted','divertedCapabilities'])
+            || (request.resource.data.diff(resource.data).affectedKeys().hasAny(['capabilitiesUpdatedAtMs']) && near(request.resource.data.capabilitiesUpdatedAtMs)))
+        && (!request.resource.data.diff(resource.data).affectedKeys().hasAny(['availability'])
+            || (request.resource.data.availability.keys().hasOnly(['emergencyBeds','icuBeds','resources','confirmedAtMs','confirmedByUid'])
+                && request.resource.data.availability.emergencyBeds is int && request.resource.data.availability.emergencyBeds >= 0 && request.resource.data.availability.emergencyBeds <= 999
+                && request.resource.data.availability.icuBeds is int && request.resource.data.availability.icuBeds >= 0 && request.resource.data.availability.icuBeds <= 999
+                && request.resource.data.availability.resources is map
+                && request.resource.data.availability.confirmedByUid == uid()
+                && near(request.resource.data.availability.confirmedAtMs)));
+    }
+
+    // ---------- ambulances ----------
+    match /ambulances/{ambulanceId} {
+      allow read: if isStaff();
+      allow create, delete: if false;
+      allow update: if (isDispatcher() && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['available']))
+        || (isAmbulance() && prof().ambulanceId == ambulanceId
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['lat','lng'])
+            && request.resource.data.lat is number && request.resource.data.lng is number);
+    }
+
+    // ---------- cases ----------
+    function canReadCase(d) {
+      return isDispatcher()
+        || (signedIn() && d.reporterUid == uid())
+        || (isAmbulance() && d.ambulanceId == prof().ambulanceId)
+        || (isHospital() && d.notifiedHospitalIds.hasAny([prof().hospitalId]));
+    }
+    function baseCapFor(t) {
+      return {'cardiac':'cardiac','stroke':'stroke','trauma':'trauma','snakebite':'antivenom','burns':'burns','obstetric':'obstetric','paediatric':'paediatrics','other':'emergency'}[t];
+    }
+    function freshCase(d) {
+      return d.keys().hasOnly(['type','severity','patients','needsIcu','brief','locationSource','reporterUid','createdAtMs','status','requiredCapabilities',
+          'lat','lng','ambulanceId','ambulanceCallSign','ambulanceAckAtMs','ambulancePos','etaSceneMin','etaSource','dispatchedAtMs','notifiedHospitalIds','offerWave',
+          'recommendedHospitalId','selectedHospitalId','selectedHospitalName','selectedAtMs','selectedByUid','overrideReason','escalation','escalationNote',
+          'duplicateOf','duplicateDismissed','arrivalConfirmedAtMs','arrivalConfirmedByUid','closedAtMs','closeReason'])
+        && d.reporterUid == uid() && d.status == 'reported' && near(d.createdAtMs)
+        && d.type in ['cardiac','stroke','trauma','snakebite','burns','obstetric','paediatric','other']
+        && d.severity in [1,2,3] && d.patients is int && d.patients >= 1 && d.patients <= 50
+        && d.needsIcu is bool && d.brief is string && d.brief.size() <= 160 && d.locationSource in ['gps','manual']
+        && d.lat is number && d.lat >= -90 && d.lat <= 90 && d.lng is number && d.lng >= -180 && d.lng <= 180
+        && capList(d.requiredCapabilities) && d.requiredCapabilities.size() >= 1 && d.requiredCapabilities.size() <= 2
+        && d.requiredCapabilities[0] == baseCapFor(d.type)
+        && d.ambulanceId == null && d.ambulanceCallSign == null && d.ambulanceAckAtMs == null && d.ambulancePos == null
+        && d.etaSceneMin == null && d.etaSource == null && d.dispatchedAtMs == null && d.notifiedHospitalIds == [] && d.offerWave == 0
+        && d.recommendedHospitalId == null && d.selectedHospitalId == null && d.selectedHospitalName == null && d.selectedAtMs == null
+        && d.selectedByUid == null && d.overrideReason == null && d.escalation == 'none' && d.escalationNote == null
+        && d.duplicateOf == null && d.duplicateDismissed == false && d.arrivalConfirmedAtMs == null && d.arrivalConfirmedByUid == null
+        && d.closedAtMs == null && d.closeReason == null;
+    }
+    function dispatcherCaseUpdate(caseId) {
+      let a = request.resource.data;
+      let b = resource.data;
+      return a.reporterUid == b.reporterUid && a.createdAtMs == b.createdAtMs && a.type == b.type && a.severity == b.severity
+        && a.lat == b.lat && a.lng == b.lng && a.requiredCapabilities == b.requiredCapabilities && a.brief == b.brief
+        && a.patients == b.patients && a.needsIcu == b.needsIcu
+        // the dispatcher may only move reported -> dispatched, or close; ambulance/hospital own the other transitions
+        && (a.status == b.status || (b.status == 'reported' && a.status == 'dispatched') || a.status == 'closed')
+        && validPos(a.ambulancePos)
+        && a.escalation in ['none','attention','no_hospital']
+        && (a.recommendedHospitalId == b.recommendedHospitalId || a.recommendedHospitalId == null
+            || qualified(get(offerPath(caseId, a.recommendedHospitalId)).data, a.requiredCapabilities))
+        // destination can only be a hospital that explicitly confirmed, and a non-recommended pick needs a written reason
+        && (a.selectedHospitalId == b.selectedHospitalId || a.selectedHospitalId == null
+            || (a.selectedByUid == uid()
+                && qualified(get(offerPath(caseId, a.selectedHospitalId)).data, a.requiredCapabilities)
+                && (a.selectedHospitalId == a.recommendedHospitalId || (a.overrideReason is string && a.overrideReason.size() >= 3))));
+    }
+    function ambulanceCaseUpdate() {
+      let a = request.resource.data;
+      let b = resource.data;
+      return isAmbulance() && b.ambulanceId == prof().ambulanceId
+        && a.diff(b).affectedKeys().hasOnly(['status','ambulancePos','etaSceneMin','etaSource','ambulanceAckAtMs'])
+        && validPos(a.ambulancePos)
+        && (a.etaSceneMin == null || (a.etaSceneMin is int && a.etaSceneMin >= 0 && a.etaSceneMin <= 600))
+        && (a.status == b.status
+            || (b.status == 'dispatched' && a.status == 'enroute' && near(a.ambulanceAckAtMs))
+            || (b.status == 'enroute' && a.status == 'onscene')
+            || (b.status == 'onscene' && a.status == 'transporting' && b.selectedHospitalId != null)
+            || (b.status == 'transporting' && a.status == 'arrived'));
+    }
+    function hospitalArrivalConfirm() {
+      let a = request.resource.data;
+      let b = resource.data;
+      return isHospital() && b.selectedHospitalId == prof().hospitalId && b.status == 'arrived'
+        && a.diff(b).affectedKeys().hasOnly(['arrivalConfirmedAtMs','arrivalConfirmedByUid'])
+        && near(a.arrivalConfirmedAtMs) && a.arrivalConfirmedByUid == uid();
+    }
+
+    match /cases/{caseId} {
+      allow get, list: if canReadCase(resource.data);
+      allow create: if signedIn() && freshCase(request.resource.data);
+      allow update: if (isDispatcher() && dispatcherCaseUpdate(caseId)) || ambulanceCaseUpdate() || hospitalArrivalConfirm();
+      allow delete: if false;
+
+      // Contact details and free text. Visible to the reporter, dispatch, the assigned crew, and (after the
+      // dispatcher confirms the destination) the receiving hospital. Not to hospitals that were only asked.
+      match /private/{docId} {
+        allow read: if docId == 'patient' && (
+          isDispatcher()
+          || (signedIn() && resource.data.reporterUid == uid())
+          || (isAmbulance() && get(casePath(caseId)).data.ambulanceId == prof().ambulanceId)
+          || (isHospital() && get(casePath(caseId)).data.selectedHospitalId == prof().hospitalId));
+        allow create: if docId == 'patient' && signedIn()
+          && request.resource.data.keys().hasOnly(['contact','note','reporterUid'])
+          && request.resource.data.reporterUid == uid()
+          && request.resource.data.contact is string && request.resource.data.contact.size() <= 40
+          && request.resource.data.note is string && request.resource.data.note.size() <= 500
+          && getAfter(casePath(caseId)).data.reporterUid == uid();
+        allow update, delete: if false;
+      }
+
+      // Append-only audit trail. Nobody can edit or delete an event once written.
+      match /events/{eventId} {
+        allow read: if isDispatcher() || (isAmbulance() && get(casePath(caseId)).data.ambulanceId == prof().ambulanceId);
+        allow create: if signedIn()
+          && request.resource.data.keys().hasOnly(['kind','text','atMs','actorUid','actorRole'])
+          && request.resource.data.actorUid == uid()
+          && near(request.resource.data.atMs)
+          && request.resource.data.text is string && request.resource.data.text.size() <= 400
+          && request.resource.data.kind is string && request.resource.data.kind.size() <= 24
+          && (
+            (isDispatcher() && request.resource.data.actorRole in ['dispatcher','system'])
+            || (isAmbulance() && request.resource.data.actorRole == 'ambulance' && get(casePath(caseId)).data.ambulanceId == prof().ambulanceId)
+            || (isHospital() && request.resource.data.actorRole == 'hospital' && get(casePath(caseId)).data.notifiedHospitalIds.hasAny([prof().hospitalId]))
+            || (!isStaff() && request.resource.data.actorRole == 'reporter' && request.resource.data.kind == 'reported'
+                && getAfter(casePath(caseId)).data.reporterUid == uid()));
+        allow update, delete: if false;
+      }
+    }
+
+    // ---------- offers: one request per hospital per case, id = caseId_hospitalId ----------
+    match /offers/{offerId} {
+      allow get, list: if isDispatcher() || (isHospital() && resource.data.hospitalId == prof().hospitalId);
+
+      allow create: if isDispatcher()
+        && request.resource.data.keys().hasOnly(['caseId','hospitalId','hospitalName','state','wave','requestedAtMs','expiresAtMs','seenAtMs','respondedAtMs',
+            'respondedByUid','confirmations','canReceive','declineReason','distanceKm','etaMin','etaSource'])
+        && offerId == request.resource.data.caseId + '_' + request.resource.data.hospitalId
+        && request.resource.data.state == 'pending' && request.resource.data.seenAtMs == null && request.resource.data.respondedAtMs == null
+        && request.resource.data.respondedByUid == null && request.resource.data.confirmations == null && request.resource.data.canReceive == null
+        && request.resource.data.declineReason == null && near(request.resource.data.requestedAtMs)
+        && request.resource.data.expiresAtMs > request.resource.data.requestedAtMs && request.resource.data.expiresAtMs <= request.resource.data.requestedAtMs + 600000
+        && getAfter(casePath(request.resource.data.caseId)).data.notifiedHospitalIds.hasAny([request.resource.data.hospitalId]);
+
+      allow update:
+        // dispatcher: time out only after the deadline, withdraw, select, or extend the deadline
+        if (isDispatcher() && (
+            (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['state'])
+              && ((resource.data.state == 'pending' && request.resource.data.state == 'timeout' && nowMs() >= resource.data.expiresAtMs)
+                  || (resource.data.state in ['pending','accepted','selected'] && request.resource.data.state == 'withdrawn')
+                  || (resource.data.state == 'accepted' && request.resource.data.state == 'selected')))
+            || (request.resource.data.diff(resource.data).affectedKeys().hasOnly(['expiresAtMs']) && resource.data.state == 'pending'
+                && request.resource.data.expiresAtMs > resource.data.expiresAtMs && request.resource.data.expiresAtMs <= nowMs() + 600000)))
+        // hospital acknowledges that it has seen the request
+        || (isHospital() && resource.data.hospitalId == prof().hospitalId
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['seenAtMs']) && near(request.resource.data.seenAtMs))
+        // hospital answers, only before the deadline, only once, with explicit confirmations
+        || (isHospital() && resource.data.hospitalId == prof().hospitalId && resource.data.state == 'pending' && nowMs() < resource.data.expiresAtMs
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['state','respondedAtMs','respondedByUid','confirmations','canReceive','declineReason'])
+            && request.resource.data.state in ['accepted','declined'] && near(request.resource.data.respondedAtMs) && request.resource.data.respondedByUid == uid()
+            && request.resource.data.confirmations is map && request.resource.data.confirmations.keys().hasOnly(['emergency','trauma','cardiac','stroke','antivenom','paediatrics','burns','icu','obstetric'])
+            && request.resource.data.canReceive is bool
+            && (request.resource.data.declineReason == null || (request.resource.data.declineReason is string && request.resource.data.declineReason.size() <= 120)))
+        // hospital withdraws a previous acceptance (e.g. resource ran out)
+        || (isHospital() && resource.data.hospitalId == prof().hospitalId && resource.data.state in ['accepted','selected']
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['state','declineReason','respondedAtMs','respondedByUid'])
+            && request.resource.data.state == 'declined' && request.resource.data.declineReason is string && request.resource.data.declineReason.size() <= 120
+            && near(request.resource.data.respondedAtMs) && request.resource.data.respondedByUid == uid());
+
       allow delete: if false;
     }
   }

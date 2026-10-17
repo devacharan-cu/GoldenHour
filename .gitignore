@@ -5,3 +5,8 @@ dist/
 *.log
 .firebase/
 *-service-account*.json
+.secrets/
+firestore-debug.log
+firebase-debug.log
+ui-debug.log
+web/test-results/
