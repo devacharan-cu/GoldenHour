@@ -1,71 +1,85 @@
-import { useEffect, useState } from 'react'
-import { seedIfEmpty, useAmbulances, useHospitals, useIncidents } from './lib/store'
-import AmbulanceView from './views/AmbulanceView'
-import Dispatch from './views/Dispatch'
-import HospitalView from './views/HospitalView'
-import Report from './views/Report'
+import { Suspense, lazy, useState } from 'react'
+import { ConnectionBanner, ErrorBox, InstallPrompt, Loading, Toasts, useToasts } from './components/bits'
+import { AuthProvider, useAuth } from './lib/auth'
+import { useAmbulances, useCases, useEscalationEngine, useHospitals, useOffers, useOnline } from './lib/store'
+import Landing from './views/Landing'
 
-type Tab = 'report' | 'dispatch' | 'hospital' | 'ambulance'
-const TABS: { id: Tab; icon: string; label: string }[] = [
-  { id: 'report', icon: '🚨', label: 'Report' },
-  { id: 'dispatch', icon: '🎛️', label: 'Dispatch' },
-  { id: 'ambulance', icon: '🚑', label: 'Ambulance' },
-  { id: 'hospital', icon: '🏥', label: 'Hospital' },
-]
+// Each role downloads only its own screen (and the map library) instead of the whole app.
+const AmbulanceView = lazy(() => import('./views/Responder'))
+const Dispatcher = lazy(() => import('./views/Dispatcher'))
+const HospitalView = lazy(() => import('./views/HospitalView'))
+const Reporter = lazy(() => import('./views/Reporter'))
 
-function load(key: string): string | null {
-  try { return localStorage.getItem(key) } catch { return null }
-}
-function save(key: string, v: string | null) {
-  try { if (v) localStorage.setItem(key, v); else localStorage.removeItem(key) } catch { /* storage unavailable */ }
-}
+function load(key: string): string | null { try { return localStorage.getItem(key) } catch { return null } }
+function save(key: string, v: string | null) { try { if (v) localStorage.setItem(key, v); else localStorage.removeItem(key) } catch { /* storage unavailable */ } }
 
-export default function App() {
-  const [tab, setTab] = useState<Tab>((load('gh-tab') as Tab) || 'report')
+const ROLE_LABEL = { dispatcher: 'Dispatcher', hospital: 'Hospital team', ambulance: 'Ambulance crew' } as const
+
+function Shell() {
+  const { status, user, profile, actor, logout } = useAuth()
+  const { messages, notify } = useToasts()
+  const online = useOnline()
+  const [reporting, setReporting] = useState(false)
+  const [dispTab, setDispTab] = useState<'console' | 'log'>('console')
   const [myId, setMyIdState] = useState<string | null>(load('gh-my'))
-  const [toast, setToast] = useState<string | null>(null)
-  const inc = useIncidents()
-  const hos = useHospitals()
-  const amb = useAmbulances()
-  const error = inc.error || hos.error || amb.error
-
-  useEffect(() => { save('gh-tab', tab) }, [tab])
-  useEffect(() => {
-    if (hos.ready && hos.data.length === 0) seedIfEmpty().catch((e) => setToast(`Seeding failed: ${e.message}`))
-  }, [hos.ready, hos.data.length])
-  useEffect(() => {
-    if (!toast) return
-    const t = setTimeout(() => setToast(null), 4000)
-    return () => clearTimeout(t)
-  }, [toast])
-
   const setMyId = (id: string | null) => { setMyIdState(id); save('gh-my', id) }
-  const shared = { incidents: inc.data, hospitals: hos.data, ambulances: amb.data, notify: setToast }
+
+  const staff = !!profile
+  const cases = useCases(user?.uid ?? null, profile)
+  const offers = useOffers(profile)
+  const hospitals = useHospitals(staff)
+  const ambulances = useAmbulances(staff)
+  useEscalationEngine(profile?.role === 'dispatcher', actor, cases.data, offers.data, hospitals.data, (m) => notify(m))
+
+  const error = cases.error || offers.error || hospitals.error || ambulances.error
+  const pending = cases.fromCache && online === true && cases.ready
+
+  let body
+  if (status === 'loading') body = <Loading label="Starting…" />
+  else if (status === 'out' && !reporting) body = <Landing onReport={() => setReporting(true)} />
+  else if (!profile) {
+    body = (
+      <Reporter
+        cases={cases.data} myId={myId} setMyId={setMyId} notify={notify} online={online}
+      />
+    )
+  } else if (profile.role === 'dispatcher') {
+    body = !hospitals.ready || !ambulances.ready || !cases.ready ? <Loading /> : dispTab === 'log'
+      ? <Reporter cases={[]} myId={null} setMyId={() => undefined} notify={notify} online={online} onSent={() => setDispTab('console')} />
+      : <Dispatcher cases={cases.data} offers={offers.data} hospitals={hospitals.data} ambulances={ambulances.data} actor={actor!} notify={notify} onLogCall={() => setDispTab('log')} />
+  } else if (profile.role === 'hospital') {
+    body = !hospitals.ready || !cases.ready ? <Loading /> : <HospitalView profile={profile} actor={actor!} hospital={hospitals.data.find((h) => h.id === profile.hospitalId)} cases={cases.data} offers={offers.data} notify={notify} />
+  } else {
+    body = !hospitals.ready || !ambulances.ready ? <Loading /> : <AmbulanceView actor={actor!} ambulance={ambulances.data.find((a) => a.id === profile.ambulanceId)} cases={cases.data} hospitals={hospitals.data} notify={notify} />
+  }
 
   return (
     <div className="shell">
       <header className="topbar">
         <div className="brand">
           <div className="logo" aria-hidden>⏱</div>
-          <div>GoldenHour<small>Every minute counts · emergency coordination</small></div>
+          <div>GoldenHour<small>Every minute counts</small></div>
         </div>
-        <div className="live"><span className={`dot ${error ? 'off' : ''}`} />{error ? 'Offline' : 'Live'}</div>
+        <div className="row tight">
+          <span className="live" role="status"><span className={`dot ${error || !online ? 'off' : ''}`} />{!online ? 'Offline' : error ? 'Problem' : 'Live'}</span>
+          {profile && <span className="chip-user">{ROLE_LABEL[profile.role]} · {profile.displayName}</span>}
+          {profile?.role === 'dispatcher' && (
+            <div className="seg-mini" role="tablist"><button role="tab" aria-selected={dispTab === 'console'} onClick={() => setDispTab('console')}>Console</button><button role="tab" aria-selected={dispTab === 'log'} onClick={() => setDispTab('log')}>Log call</button></div>
+          )}
+          {status === 'in' && <button className="btn sm" onClick={() => { void logout(); setReporting(false) }}>{profile ? 'Sign out' : 'Leave'}</button>}
+          {status === 'out' && reporting && <button className="btn sm" onClick={() => setReporting(false)}>Back</button>}
+        </div>
       </header>
-      <nav className="tabs" role="tablist" aria-label="Role">
-        {TABS.map((t) => (
-          <button key={t.id} role="tab" aria-selected={tab === t.id} className="tab" onClick={() => setTab(t.id)}>
-            <span aria-hidden>{t.icon}</span>{t.label}
-          </button>
-        ))}
-      </nav>
-      {error && <div className="err">Cannot reach the database: {error}</div>}
-      {toast && <div className="toast" role="status">{toast}</div>}
-      <main>
-        {tab === 'report' && <Report {...shared} myId={myId} setMyId={setMyId} />}
-        {tab === 'dispatch' && <Dispatch {...shared} />}
-        {tab === 'ambulance' && <AmbulanceView {...shared} />}
-        {tab === 'hospital' && <HospitalView {...shared} />}
-      </main>
+      <ConnectionBanner pendingWrites={pending} />
+      <InstallPrompt compact={!!profile} />
+      {error && <ErrorBox retry={() => window.location.reload()}>Some live data could not load: {error}</ErrorBox>}
+      <Toasts messages={messages} />
+      <main id="main"><Suspense fallback={<Loading />}>{body}</Suspense></main>
+      <footer className="foot">Demonstration system · not for real emergency dispatch · call 112 in India</footer>
     </div>
   )
+}
+
+export default function App() {
+  return <AuthProvider><Shell /></AuthProvider>
 }
