@@ -35,10 +35,12 @@ hold only one case (enforced by the database rules, not just the app).
 
 | Area | Detail |
 |---|---|
-| **Reporter** | 4-step flow with review, **evidence composer** (camera, voice recorder, files, drag and drop, previews, per-type validation), live tracking, a secret **receipt code** to reopen a report on any device |
+| **Reporter** | 4-step flow with review, **evidence composer** (live in-app camera with shutter, retake and confirm; video; voice recorder; gallery and file pickers; previews; per-type validation; fallback to the phone's camera app), withdraw an untouched report, live tracking, a secret **receipt code** to reopen a report on any device |
 | **Dispatcher** | Live queue with "your move" markers, evidence viewer (checksum verified), AI briefing review, crew assignment, hospital responses, destination approval, handover and close, duplicate warnings, escalation, **searchable incident history** |
 | **Crew** | Incoming dispatch, accept or decline, navigation link, real GPS or simulated drive, destination acknowledgement, pickup, big thumb-reach actions |
 | **Hospital** | Request inbox with countdown, per-case confirmation form, reviewed briefing and evidence, arrival confirmation, withdraw, capability profile, live availability, diversion |
+| **Accounts** | Guest reporting always works. Anyone can create an email or **Google** account from *Account and settings*; a guest is upgraded in place, so reports and receipts are kept. Staff accounts are provisioned by an administrator. |
+| **Ending a case** | Dispatch can end a case as false, accidental, duplicate or cancelled (reason, confirmation, audit event, ambulance released, hospitals stood down; blocked once the patient is on board). Nothing is deleted. A declining hospital may suggest an eligible alternative that dispatch can ask; it must still confirm. |
 | **Everyone** | Light, dark or follow-device theme, text size, calm motion, sound and desktop alerts for new work, profile, password change, device-data erase. Installable PWA that works offline. |
 
 ### Evidence storage (and why it is not Cloud Storage)
@@ -98,9 +100,10 @@ Emulator tests need the Firebase CLI and a Java runtime. Local demo with no clou
 Under emulators the AI panel uses a clearly labelled fake model so the review flow is testable offline.
 
 ### Production setup (project owner, one time)
-1. Firebase console, Authentication: enable **Email/Password** and **Anonymous**.
+1. Firebase console, Authentication: enable **Email/Password**, **Anonymous** and **Google**.
 2. Firebase console, **AI Logic, Get started, Gemini Developer API** (the no-cost provider; not the Vertex/Agent Platform option, which needs billing).
-3. `node web/scripts/provision.mjs --prod` creates accounts (random passwords go to the git-ignored `.secrets/accounts.json`), then `node web/scripts/demo-logins.mjs --open`.
+3. `node web/scripts/provision.mjs --prod` creates accounts (random passwords go to the git-ignored `.secrets/accounts.json`); add `--easy` for one short temporary demo password. Then `node web/scripts/demo-logins.mjs --open`, and `node web/scripts/verify-accounts.mjs` to confirm every role. Rotate afterwards with `--reset-passwords`.
+   Check Gemini with `npm run verify:ai` (one labelled synthetic case, real model call, case cancelled afterwards).
 4. `firebase deploy --only firestore:rules,hosting`.
 
 ## Tests
@@ -108,7 +111,7 @@ Under emulators the AI panel uses a clearly labelled fake model so the review fl
 Unit tests (matching, escalation, relay, evidence validation, upload queue, AI parsing and guardrails, history filters), Firestore emulator tests
 (rules from every role's viewpoint and full multi-user workflows), a real-browser suite with independent sessions (login and session restore, themes, the full
 three-laptop scenario with every media type, decline and re-assignment, real GPS vs simulation, history and receipts, offline, AI failure modes, phone layouts in both themes),
-and a mutation check that deliberately breaks the rules. See [SECURITY.md](SECURITY.md) for what the tests prove and what they do not.
+a **device matrix** (`npm run test:devices`: 11 phone and tablet profiles in Chromium and WebKit, light and dark: overflow, tap targets, camera entry point, full report flow, every staff role), and a mutation check that deliberately breaks the rules. The device matrix uses emulated profiles, not physical phones; real camera hardware, iOS Safari quirks and the install flow still need a real device. See [SECURITY.md](SECURITY.md) for what the tests prove and what they do not.
 
 ## Honest limitations
 - **No server:** the hospital pre-alert, deadlines and re-routing run in an *open dispatcher console*. With none open, they pause.
