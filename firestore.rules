@@ -1,0 +1,27 @@
+rules_version = '2';
+// DEMO RULES: the app has no user accounts yet, so reads are public and writes are limited to
+// the three app collections with shape checks and no deletes. Add Firebase Auth + roles before real use.
+service cloud.firestore {
+  match /databases/{database}/documents {
+    match /incidents/{id} {
+      allow read: if true;
+      allow create: if request.resource.data.keys().hasAll(['type','severity','lat','lng','status','createdAtMs'])
+                    && request.resource.data.severity in [1,2,3]
+                    && request.resource.data.lat is number && request.resource.data.lng is number
+                    && request.resource.data.note is string && request.resource.data.note.size() <= 500
+                    && request.resource.data.contact is string && request.resource.data.contact.size() <= 40;
+      allow update: if true;
+      allow delete: if false;
+    }
+    match /hospitals/{id} {
+      allow read: if true;
+      allow create, update: if request.resource.data.name is string && request.resource.data.emergencyBeds is int;
+      allow delete: if false;
+    }
+    match /ambulances/{id} {
+      allow read: if true;
+      allow create, update: if request.resource.data.callSign is string;
+      allow delete: if false;
+    }
+  }
+}
