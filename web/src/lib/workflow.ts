@@ -13,6 +13,18 @@ function addEvent(db: Firestore, b: WriteBatch, caseId: string, actor: Actor | '
   b.set(doc(collection(db, 'cases', caseId, 'events')), { kind, text, atMs: now, actorUid, actorRole })
 }
 
+/**
+ * Free the ambulance, but only if its own record still points at this case. If it does not (for example the fleet record was reset
+ * or already freed), writing it would be refused by the rules and would block the whole close, so it is simply left alone.
+ */
+async function releaseAmbulance(db: Firestore, b: WriteBatch, c: Pick<Case, 'id' | 'ambulanceId'>): Promise<void> {
+  if (!c.ambulanceId) return
+  const ref = doc(db, 'ambulances', c.ambulanceId)
+  let holds = true // if it cannot be read, try anyway
+  try { holds = (await getDoc(ref)).data()?.currentCaseId === c.id } catch { /* offline: fall through */ }
+  if (holds) b.update(ref, { available: true, currentCaseId: null })
+}
+
 export const offerId = (caseId: string, hospitalId: string) => `${caseId}_${hospitalId}`
 
 // ---------------------------------------------------------------- reporting
@@ -126,7 +138,7 @@ export async function crewDecline(db: Firestore, actor: Actor, c: Case, reason: 
     status: 'reported', ambulanceId: null, ambulanceCallSign: null, ambulancePos: null, dispatchedAtMs: null, crewOfferedAtMs: null, etaSceneMin: null, etaSource: null,
     declinedAmbulanceIds: [...c.declinedAmbulanceIds, c.ambulanceId], crewDeclineReason: reason.slice(0, 120),
   })
-  b.update(doc(db, 'ambulances', c.ambulanceId), { available: true, currentCaseId: null })
+  await releaseAmbulance(db, b, c)
   addEvent(db, b, c.id, actor, null, 'crew_declined', `${c.ambulanceCallSign} declined: ${reason}`, now)
   await b.commit()
 }
@@ -138,7 +150,7 @@ export async function cancelAssignment(db: Firestore, actor: Actor, c: Case, rea
   b.update(doc(db, 'cases', c.id), {
     status: 'reported', ambulanceId: null, ambulanceCallSign: null, ambulancePos: null, dispatchedAtMs: null, crewOfferedAtMs: null, etaSceneMin: null, etaSource: null, ambulanceAckAtMs: null,
   })
-  b.update(doc(db, 'ambulances', c.ambulanceId), { available: true, currentCaseId: null })
+  await releaseAmbulance(db, b, c)
   addEvent(db, b, c.id, actor, null, 'assignment_cancelled', `Offer to ${c.ambulanceCallSign} taken back: ${reason}`, now)
   await b.commit()
 }
@@ -352,7 +364,7 @@ export async function closeCase(db: Firestore, actor: Actor, c: Case, reason: st
   if (c.status === 'arrived' && !c.arrivalConfirmedAtMs) throw new Error('The hospital has not confirmed receipt of the patient yet')
   const b = writeBatch(db)
   b.update(doc(db, 'cases', c.id), { status: 'closed', closedAtMs: now, closeReason: reason })
-  if (c.ambulanceId) b.update(doc(db, 'ambulances', c.ambulanceId), { available: true, currentCaseId: null })
+  await releaseAmbulance(db, b, c)
   addEvent(db, b, c.id, actor, null, 'closed', `Case closed: ${reason}`, now)
   await b.commit()
 }
@@ -377,7 +389,7 @@ export async function cancelCase(db: Firestore, actor: Actor, c: Case, kind: Can
     activeHospitalIds: [], selectedHospitalId: null, selectedHospitalName: null,
   })
   for (const o of offers.filter((x) => x.caseId === c.id && ['pending', 'accepted', 'selected'].includes(x.state))) b.update(doc(db, 'offers', o.id), { state: 'withdrawn' })
-  if (c.ambulanceId) b.update(doc(db, 'ambulances', c.ambulanceId), { available: true, currentCaseId: null })
+  await releaseAmbulance(db, b, c)
   addEvent(db, b, c.id, actor, null, 'cancelled', `Case ended as ${CANCEL_PREFIX[kind].toLowerCase()}: ${why}`, now)
   await b.commit()
 }
@@ -396,7 +408,7 @@ export async function markDuplicate(db: Firestore, actor: Actor, c: Case, ofCase
   if (!canCancelStatus(c.status)) throw new Error('The patient is already on board or the case is closed, so it cannot be merged.')
   const b = writeBatch(db)
   b.update(doc(db, 'cases', c.id), { duplicateOf: ofCase.id, status: 'closed', closedAtMs: now, closeReason: 'Duplicate report' })
-  if (c.ambulanceId) b.update(doc(db, 'ambulances', c.ambulanceId), { available: true, currentCaseId: null })
+  await releaseAmbulance(db, b, c)
   addEvent(db, b, c.id, actor, null, 'duplicate', `Marked as duplicate of case ${ofCase.id.slice(0, 6)}`, now)
   await b.commit()
 }

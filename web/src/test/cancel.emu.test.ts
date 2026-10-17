@@ -133,3 +133,16 @@ describe('opening a receipt more than once', () => {
     await expect(claimCase(thief.db, thief.actor, caseId, 'x'.repeat(32))).rejects.toThrow() // still refused the second time
   })
 })
+
+describe('ending a case whose ambulance record is already free', () => {
+  it('still ends the case instead of failing with a permissions error (stale or reset fleet record)', async () => {
+    const id = await reportCase('trauma')
+    await dispatchIt(id)
+    const d = disp()
+    // the fleet record was reset while the case was live
+    await updateDoc(doc(d.db, 'ambulances', 'a1'), { available: true, currentCaseId: null })
+    await cancelCase(d.db, d.actor, await readCase(d.db, id), 'false', 'Ambulance record was reset', await readOffers(d.db, id))
+    expect((await readCase(d.db, id)).status).toBe('closed')
+    expect((await getDoc(doc(d.db, 'ambulances', 'a1'))).data()).toMatchObject({ available: true, currentCaseId: null })
+  })
+})
